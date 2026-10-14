@@ -10,9 +10,6 @@
   <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-ee6585?style=flat-square&logo=windows11&logoColor=white" />
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-ee6585?style=flat-square&logo=rust&logoColor=white" />
   <img alt="GPUI" src="https://img.shields.io/badge/UI-GPUI-ee6585?style=flat-square" />
-  <img alt="exe 7.4 MB" src="https://img.shields.io/badge/exe-7.4%20MB-8b5cf6?style=flat-square" />
-  <img alt="memory ~30 MB" src="https://img.shields.io/badge/内存-~30%20MB-8b5cf6?style=flat-square" />
-  <img alt="no WebView" src="https://img.shields.io/badge/WebView-无-22a06b?style=flat-square" />
 </p>
 
 [功能亮点](#-功能亮点) · [截图](#-截图) · [快速开始](#-快速开始) · [使用指南](#-使用指南) · [AI 助手](#-ai-助手) · [配置](#%EF%B8%8F-配置文件) · [性能](#-性能)
