@@ -4,7 +4,7 @@
 
 # LovelyLauncher
 
-**小工具，大进步。** 一个轻量、快捷、可爱的 Windows 工具启动器。
+**小工具，大进步。** 一个轻量、快捷的 Windows 工具启动器。
 
 <p>
   <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-ee6585?style=flat-square&logo=windows11&logoColor=white" />
@@ -35,9 +35,8 @@
 <td width="50%" valign="top">
 
 **⚡ 轻、快**
-- 基于 [GPUI](https://gpui.rs)（Zed 编辑器的 GPU 渲染框架），**不依赖 WebView / Electron**
-- 单文件 exe 约 7 MB，常驻内存约 30 MB，**隐藏到托盘后不到 1 MB**
-- 网络请求走 Windows 自带的 WinHTTP，没有额外的 TLS / HTTP 库
+- 基于 [GPUI](https://gpui.rs)
+- 单文件 exe 约 7 MB，upx压缩后不到 3M，常驻内存约 30 MB，**隐藏到托盘后不到 1 MB**
 
 **🔍 一个输入框搞定一切**
 - 工具、开始菜单应用、项目、快捷操作统一模糊搜索
