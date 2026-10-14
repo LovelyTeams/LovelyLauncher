@@ -231,6 +231,14 @@ impl gpui::Render for DragPreview {
     }
 }
 
+#[derive(Default)]
+pub struct UpdateState {
+    pub checking: bool,
+    pub available: Option<crate::update::ReleaseInfo>,
+    pub progress: Option<Arc<Progress>>,
+    pub status: Option<(SharedString, bool)>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AiState {
     Streaming,
@@ -300,6 +308,7 @@ pub struct Launcher {
     /// The latest `@ai` answer (kept while its question is still in the box).
     pub(crate) ai: Option<AiAnswer>,
     pub(crate) ai_scroll: ScrollHandle,
+    pub(crate) update: UpdateState,
     pub(crate) body_scroll: ScrollHandle,
     pub(crate) apps: Arc<Vec<AppEntry>>,
     icons: HashMap<String, IconSlot>,
@@ -330,6 +339,7 @@ impl Launcher {
     pub fn new(
         mut config: Config,
         hotkey_error: Option<String>,
+        updated: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -396,6 +406,7 @@ impl Launcher {
             results_scroll: ScrollHandle::new(),
             ai: None,
             ai_scroll: ScrollHandle::new(),
+            update: UpdateState::default(),
             body_scroll: ScrollHandle::new(),
             apps: Arc::new(Vec::new()),
             icons: HashMap::new(),
@@ -421,8 +432,11 @@ impl Launcher {
         window.focus(&this.search.focus_handle(cx));
         if let Some(err) = hotkey_error {
             this.show_toast(err, true, cx);
+        } else if updated {
+            this.show_toast(format!("已更新到 v{}", crate::update::CURRENT_VERSION), false, cx);
         }
         this.scan_apps(cx);
+        this.schedule_update_check(cx);
         this
     }
 
@@ -837,6 +851,147 @@ impl Launcher {
         }
         let query = self.search_text.clone();
         self.refresh_results_with(&query);
+    }
+
+    // -----------------------------------------------------------------------
+    // Updates
+
+    fn schedule_update_check(&mut self, cx: &mut Context<Self>) {
+        let settings = &self.config.settings;
+        if !settings.auto_check_update || now_secs().saturating_sub(settings.last_update_check) < 20 * 3600 {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            // Give startup (and the network) a moment first.
+            cx.background_executor().timer(Duration::from_secs(8)).await;
+            this.update(cx, |this, cx| this.check_update(false, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Look for a newer release. `manual` checks report "up to date" too.
+    pub fn check_update(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update.checking || self.update.progress.is_some() {
+            return;
+        }
+        self.update.checking = true;
+        if manual {
+            self.update.status = Some(("正在检查更新…".into(), false));
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async { crate::update::check() }).await;
+            this.update(cx, |this, cx| {
+                this.update.checking = false;
+                this.config.settings.last_update_check = now_secs();
+                this.config.save();
+                match result {
+                    Ok(Some(info)) => {
+                        let msg = format!(
+                            "发现新版本 v{}（{:.1} MB）",
+                            info.version,
+                            info.asset_size as f64 / 1024. / 1024.
+                        );
+                        if !manual {
+                            this.show_toast(format!("{msg}，可在 设置 → 通用 中一键更新"), false, cx);
+                        }
+                        this.update.status = Some((msg.into(), false));
+                        this.update.available = Some(info);
+                    }
+                    Ok(None) => {
+                        this.update.available = None;
+                        this.update.status = manual.then(|| {
+                            (format!("已是最新版本 v{}", crate::update::CURRENT_VERSION).into(), false)
+                        });
+                    }
+                    Err(err) => {
+                        this.update.status = manual.then(|| (err.into(), true));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Download, verify and install the available release, then restart into it.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.update.available.clone() else {
+            return;
+        };
+        if self.update.progress.is_some() {
+            return;
+        }
+        let progress = Arc::new(Progress::default());
+        self.update.progress = Some(progress.clone());
+        self.update.status = Some((format!("正在下载 v{}…", info.version).into(), false));
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let thread_progress = progress.clone();
+        std::thread::Builder::new()
+            .name("update".into())
+            .spawn(move || {
+                let result = crate::update::download(&info, &thread_progress)
+                    .and_then(|staged| crate::update::install_and_restart(&staged));
+                let _ = tx.send(result);
+            })
+            .ok();
+
+        // Keep the progress text moving while the download runs.
+        let ticker = progress.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(300)).await;
+                let running = this
+                    .update(cx, |this, cx| {
+                        let same = this.update.progress.as_ref().is_some_and(|p| Arc::ptr_eq(p, &ticker));
+                        if same {
+                            if let Some(f) = ticker.fraction() {
+                                this.update.status = Some((format!("正在下载… {:.0}%", f * 100.).into(), false));
+                            }
+                            cx.notify();
+                        }
+                        same
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("更新线程意外退出".into()));
+            this.update(cx, |this, cx| {
+                this.update.progress = None;
+                match result {
+                    Ok(()) => {
+                        // The new version is starting and waits for us to exit.
+                        this.config.save();
+                        cx.quit();
+                    }
+                    Err(err) => {
+                        this.update.status = Some((err.into(), true));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn open_release_page(&mut self, cx: &mut Context<Self>) {
+        let url = self
+            .update
+            .available
+            .as_ref()
+            .map(|i| i.page_url.clone())
+            .unwrap_or_else(|| format!("https://github.com/{}/releases", crate::update::REPO));
+        self.spawn_launch(url, String::new(), String::new(), false, cx);
     }
 
     // -----------------------------------------------------------------------

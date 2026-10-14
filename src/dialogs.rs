@@ -1298,6 +1298,22 @@ impl Launcher {
                             ),
                     )
                     .child(self.input_box(&editor.terminal, theme, window, cx).w(px(200.))),
+            )
+            .child(section("关于与更新"))
+            .child(self.render_update_row(theme, cx))
+            .child(
+                toggle(
+                    "auto-update",
+                    "启动时自动检查更新",
+                    "每天最多检查一次，发现新版本时提醒你",
+                    self.config.settings.auto_check_update,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.config.settings.auto_check_update = !this.config.settings.auto_check_update;
+                    this.config.save();
+                    cx.notify();
+                })),
             );
 
         let tabs = SettingsTab::ALL.into_iter().enumerate().map(|(ix, tab)| {
@@ -1349,6 +1365,94 @@ impl Launcher {
                     .children(tabs),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_update_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let update = &self.update;
+        let busy = update.checking || update.progress.is_some();
+        let available = update.available.as_ref();
+        let notes: Option<String> = available.map(|i| {
+            i.notes
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('>'))
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .child(format!("LovelyLauncher v{}", crate::update::CURRENT_VERSION)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_faint)
+                                    .child(format!("github.com/{}", crate::update::REPO)),
+                            ),
+                    )
+                    .when(available.is_some() && !busy, |d| {
+                        d.child(button("update-now", "下载并更新", true, theme).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| this.install_update(cx),
+                        )))
+                    })
+                    .child(
+                        button(
+                            if available.is_some() { "release-page" } else { "check-update" },
+                            if available.is_some() {
+                                "查看发布页"
+                            } else if update.checking {
+                                "检查中…"
+                            } else {
+                                "检查更新"
+                            },
+                            false,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if this.update.available.is_some() {
+                                this.open_release_page(cx);
+                            } else {
+                                this.check_update(true, cx);
+                            }
+                        })),
+                    ),
+            )
+            .when_some(update.status.clone(), |d, (msg, error)| {
+                d.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(if error { theme.danger } else { theme.accent })
+                        .child(msg),
+                )
+            })
+            .when_some(notes.filter(|n| !n.is_empty()), |d, notes| {
+                d.child(
+                    div()
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(theme.kbd_bg)
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .children(notes.lines().map(|l| div().child(l.to_string())).collect::<Vec<_>>()),
+                )
+            })
             .into_any_element()
     }
 

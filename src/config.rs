@@ -123,6 +123,9 @@ pub struct Settings {
     pub ai_providers: Vec<AiProvider>,
     /// Id of the provider `@ai` uses.
     pub ai_active: String,
+    /// Look for a new release on GitHub shortly after startup (at most daily).
+    pub auto_check_update: bool,
+    pub last_update_check: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +229,8 @@ impl Default for Settings {
             search_engine: SEARCH_ENGINES[0].1.into(),
             ai_providers: default_ai_providers(),
             ai_active: "deepseek".into(),
+            auto_check_update: true,
+            last_update_check: 0,
         }
     }
 }

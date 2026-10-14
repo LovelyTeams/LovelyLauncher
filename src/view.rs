@@ -407,6 +407,18 @@ impl Launcher {
             .child(
                 title_button("settings", "settings", theme)
                     .ml(px(4.))
+                    .relative()
+                    .when(self.update.available.is_some(), |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(6.))
+                                .right(px(6.))
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(theme.accent),
+                        )
+                    })
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.open_settings(window, cx)
                     })),

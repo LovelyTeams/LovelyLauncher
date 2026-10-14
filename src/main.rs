@@ -14,6 +14,7 @@ mod launcher;
 mod search;
 mod system;
 mod theme;
+mod update;
 mod view;
 mod win;
 
@@ -31,6 +32,17 @@ use crate::{
 };
 
 fn main() {
+    // A freshly installed update waits for the previous version to exit first,
+    // otherwise the single-instance check would just hand off to it.
+    let args: Vec<String> = std::env::args().collect();
+    let updated = match args.iter().position(|a| a == "--after-update") {
+        Some(i) => {
+            let pid = args.get(i + 1).and_then(|p| p.parse().ok()).unwrap_or(0);
+            update::finish_after_update(pid);
+            true
+        }
+        None => false,
+    };
     if let win::Instance::Secondary = win::acquire_single_instance() {
         // The running instance has been asked to show itself.
         return;
@@ -92,7 +104,7 @@ fn main() {
                         app_id: Some("LovelyLauncher".into()),
                         ..Default::default()
                     },
-                    move |window, cx| cx.new(|cx| Launcher::new(config, hotkey_error, window, cx)),
+                    move |window, cx| cx.new(|cx| Launcher::new(config, hotkey_error, updated, window, cx)),
                 )
                 .expect("failed to open the launcher window");
 
