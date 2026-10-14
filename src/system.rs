@@ -18,6 +18,8 @@ pub enum AppEvent {
     Show,
     Settings,
     Quit,
+    /// Space / arrows / Esc in an Explorer file list (QuickLook-style preview).
+    Preview(crate::preview::hook::HookEvent),
 }
 
 pub struct HotkeyService {

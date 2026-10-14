@@ -309,6 +309,7 @@ pub struct Launcher {
     pub(crate) ai: Option<AiAnswer>,
     pub(crate) ai_scroll: ScrollHandle,
     pub(crate) update: UpdateState,
+    pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
     pub(crate) body_scroll: ScrollHandle,
     pub(crate) apps: Arc<Vec<AppEntry>>,
     icons: HashMap<String, IconSlot>,
@@ -407,6 +408,7 @@ impl Launcher {
             ai: None,
             ai_scroll: ScrollHandle::new(),
             update: UpdateState::default(),
+            preview: None,
             body_scroll: ScrollHandle::new(),
             apps: Arc::new(Vec::new()),
             icons: HashMap::new(),
@@ -492,6 +494,7 @@ impl Launcher {
                 self.show(window, cx);
                 self.open_settings(window, cx);
             }
+            AppEvent::Preview(event) => self.handle_preview_event(event, cx),
             AppEvent::Quit => {
                 self.config.save();
                 cx.quit();
@@ -851,6 +854,177 @@ impl Launcher {
         }
         let query = self.search_text.clone();
         self.refresh_results_with(&query);
+    }
+
+    // -----------------------------------------------------------------------
+    // Quick preview
+
+    fn preview_open(&self, cx: &mut Context<Self>) -> bool {
+        self.preview.is_some_and(|h| h.update(cx, |_, _, _| ()).is_ok())
+    }
+
+    fn handle_preview_event(&mut self, event: crate::preview::hook::HookEvent, cx: &mut Context<Self>) {
+        use crate::preview::hook::{self, HookEvent};
+        match event {
+            HookEvent::Toggle { hwnd } => {
+                if self.preview_open(cx) {
+                    self.close_preview(cx);
+                } else if let Some(path) = hook::selected_path(hwnd) {
+                    self.open_preview(path, Some(hwnd), cx);
+                }
+            }
+            HookEvent::Navigate { hwnd } => {
+                if !self.preview_open(cx) {
+                    return;
+                }
+                if let (Some(handle), Some(path)) = (self.preview, hook::selected_path(hwnd)) {
+                    handle
+                        .update(cx, |preview, window, cx| {
+                            if preview.path() != path {
+                                preview.show_path(path, window, cx);
+                            }
+                        })
+                        .ok();
+                }
+            }
+            HookEvent::Close => self.close_preview(cx),
+        }
+    }
+
+    pub fn close_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.preview.take() {
+            handle.update(cx, |preview, window, _| preview.close(window)).ok();
+        }
+    }
+
+    /// Preview `path` in the (single) preview window, opening it if needed.
+    pub fn open_preview(&mut self, path: PathBuf, anchor: Option<isize>, cx: &mut Context<Self>) {
+        if let Some(handle) = self.preview {
+            let reused = handle
+                .update(cx, |preview, window, cx| preview.show_path(path.clone(), window, cx))
+                .is_ok();
+            if reused {
+                return;
+            }
+        }
+        let (w, h) = crate::preview::initial_size(crate::preview::kind_of(&path));
+        let launcher = cx.weak_entity();
+        let options = gpui::WindowOptions {
+            window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+                None,
+                gpui::size(gpui::px(w), gpui::px(h)),
+                cx,
+            ))),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("LovelyLauncher 预览".into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            // Shown later without activation, so Explorer keeps the keyboard.
+            show: false,
+            focus: false,
+            window_min_size: Some(gpui::size(gpui::px(360.), gpui::px(220.))),
+            app_id: Some("LovelyLauncher".into()),
+            ..Default::default()
+        };
+        match cx.open_window(options, move |window, cx| {
+            cx.new(|cx| crate::preview::Preview::new(path, anchor, launcher, window, cx))
+        }) {
+            Ok(handle) => self.preview = Some(handle),
+            Err(err) => self.show_toast(format!("无法打开预览：{err}"), true, cx),
+        }
+    }
+
+    /// Download FFmpeg for video / audio previews.
+    pub fn download_ffmpeg(&mut self, cx: &mut Context<Self>) {
+        use crate::preview::ffmpeg::{self, FfmpegState};
+        if cx.global::<FfmpegState>().download.is_some() {
+            return;
+        }
+        let progress = Arc::new(Progress::default());
+        cx.update_global::<FfmpegState, _>(|state, _| {
+            state.download = Some(progress.clone());
+            state.error = None;
+        });
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let thread_progress = progress.clone();
+        std::thread::Builder::new()
+            .name("ffmpeg-download".into())
+            .spawn(move || {
+                let _ = tx.send(ffmpeg::download_and_install(&thread_progress));
+            })
+            .ok();
+        // Repaint every window (settings, previews) while the progress moves.
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                let running = cx
+                    .update(|cx| {
+                        cx.refresh_windows();
+                        cx.global::<FfmpegState>().download.is_some()
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("下载线程意外退出".into()));
+            this.update(cx, |this, cx| {
+                cx.update_global::<FfmpegState, _>(|state, _| {
+                    state.download = None;
+                    match &result {
+                        Ok(path) => state.path = Some(path.clone()),
+                        Err(err) => state.error = Some(err.clone().into()),
+                    }
+                });
+                match result {
+                    Ok(_) => this.show_toast("FFmpeg 已就绪，可以预览视频了", false, cx),
+                    Err(err) => this.show_toast(format!("FFmpeg 下载失败：{err}"), true, cx),
+                }
+                cx.refresh_windows();
+            })
+            .ok();
+        })
+        .detach();
+        cx.refresh_windows();
+    }
+
+    /// Let the user pick an existing ffmpeg.exe.
+    pub fn choose_ffmpeg(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 ffmpeg.exe".into()),
+        });
+        self.prompting = true;
+        cx.spawn(async move |this, cx| {
+            let picked = rx.await.ok().and_then(|r| r.ok()).flatten().and_then(|p| p.into_iter().next());
+            this.update(cx, |this, cx| {
+                this.prompting = false;
+                let Some(path) = picked else { return };
+                let is_ffmpeg = path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("ffmpeg.exe"));
+                if !is_ffmpeg {
+                    this.show_toast("请选择 ffmpeg.exe", true, cx);
+                    return;
+                }
+                this.config.settings.ffmpeg_path = path.display().to_string();
+                this.config.save();
+                cx.update_global::<crate::preview::ffmpeg::FfmpegState, _>(|state, _| {
+                    state.path = Some(path);
+                    state.error = None;
+                });
+                this.show_toast("已设置 FFmpeg", false, cx);
+                cx.refresh_windows();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // -----------------------------------------------------------------------

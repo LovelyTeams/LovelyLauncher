@@ -52,14 +52,16 @@ pub struct ToolEditor {
 pub enum SettingsTab {
     General,
     Appearance,
+    Preview,
     Ai,
     Search,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 4] = [
+    const ALL: [SettingsTab; 5] = [
         SettingsTab::General,
         SettingsTab::Appearance,
+        SettingsTab::Preview,
         SettingsTab::Ai,
         SettingsTab::Search,
     ];
@@ -68,6 +70,7 @@ impl SettingsTab {
         match self {
             SettingsTab::General => "通用",
             SettingsTab::Appearance => "外观",
+            SettingsTab::Preview => "预览",
             SettingsTab::Ai => "AI 助手",
             SettingsTab::Search => "搜索",
         }
@@ -108,6 +111,7 @@ impl Dialog {
             Dialog::Settings(s) => match s.tab {
                 SettingsTab::General => vec![s.hotkey.clone(), s.terminal.clone()],
                 SettingsTab::Appearance => vec![s.accent.clone()],
+                SettingsTab::Preview => Vec::new(),
                 SettingsTab::Ai => vec![s.ai_base_url.clone(), s.ai_key.clone(), s.ai_model.clone()],
                 SettingsTab::Search => vec![s.search_url.clone()],
             },
@@ -1348,6 +1352,7 @@ impl Launcher {
         let body = match editor.tab {
             SettingsTab::General => general.into_any_element(),
             SettingsTab::Appearance => appearance.into_any_element(),
+            SettingsTab::Preview => self.render_preview_settings(theme, cx),
             SettingsTab::Ai => self.render_ai_settings(editor, theme, window, cx),
             SettingsTab::Search => self.render_search_settings(editor, theme, window, cx),
         };
@@ -1365,6 +1370,95 @@ impl Launcher {
                     .children(tabs),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_preview_settings(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::preview::ffmpeg::{self, FfmpegState};
+        let state = cx.global::<FfmpegState>();
+        let path = state.path.clone();
+        let progress = state.download.as_ref().map(|p| p.fraction().unwrap_or(0.));
+        let error = state.error.clone();
+        let enabled = self.config.settings.space_preview;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .id("space-preview")
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let on = !this.config.settings.space_preview;
+                        this.config.settings.space_preview = on;
+                        this.config.save();
+                        crate::preview::hook::ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.5)).child("空格快速预览"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_faint)
+                                    .child("在资源管理器或桌面选中文件后按空格预览，再按空格或 Esc 关闭；方向键切换文件"),
+                            ),
+                    )
+                    .child(switch("space-preview-switch", enabled, theme)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_faint)
+                    .child("支持：Markdown、图片、文本与代码、Word（.docx）、Excel（.xlsx）、CSV / TSV、音频、视频、文件夹"),
+            )
+            .child(
+                div()
+                    .mt(px(6.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.accent)
+                    .child("FFmpeg（视频与 FLAC / OGG / M4A 等音频）"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(if path.is_some() { theme.text_muted } else { theme.text_faint })
+                    .child(match &path {
+                        Some(p) => format!("已就绪：{}", p.display()),
+                        None => "未安装。MP3 / WAV / WMA 无需 FFmpeg 也能播放".to_string(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(match progress {
+                        Some(f) => button("ffmpeg-progress", "下载中…", true, theme)
+                            .child(format!(" {:.0}%", f * 100.))
+                            .into_any_element(),
+                        None => button("ffmpeg-download", if path.is_some() { "重新下载" } else { "一键下载" }, path.is_none(), theme)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.download_ffmpeg(cx)))
+                            .into_any_element(),
+                    })
+                    .child(button("ffmpeg-choose", "选择本地 ffmpeg.exe…", false, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| this.choose_ffmpeg(cx),
+                    ))),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_faint)
+                    .child(format!("一键下载来自 gyan.dev 的 FFmpeg essentials 版本（{}），保存在本机应用数据目录", ffmpeg::DOWNLOAD_SIZE_HINT)),
+            )
+            .when_some(error, |d, err| d.child(div().text_size(px(12.)).text_color(theme.danger).child(err)))
             .into_any_element()
     }
 

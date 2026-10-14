@@ -126,6 +126,10 @@ pub struct Settings {
     /// Look for a new release on GitHub shortly after startup (at most daily).
     pub auto_check_update: bool,
     pub last_update_check: u64,
+    /// Press Space in Explorer / on the desktop to preview the selected file.
+    pub space_preview: bool,
+    /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
+    pub ffmpeg_path: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +235,8 @@ impl Default for Settings {
             ai_active: "deepseek".into(),
             auto_check_update: true,
             last_update_check: 0,
+            space_preview: true,
+            ffmpeg_path: String::new(),
         }
     }
 }

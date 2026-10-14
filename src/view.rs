@@ -1314,7 +1314,7 @@ impl Launcher {
                     .into_any_element()
             }
             Some((text, state, _)) => {
-                let mut blocks = render_markdown(text, theme, cx);
+                let mut blocks = crate::markdown::render(text, None, theme);
                 if text.is_empty() && streaming {
                     blocks.push(
                         div()
@@ -1487,6 +1487,7 @@ impl Launcher {
                         }),
                         false,
                     ),
+                    ("eye", "快速预览".into(), MenuCommand::Preview(path.clone()), false),
                     ("folder-open", "打开所在文件夹".into(), MenuCommand::RevealPath(shown.clone()), false),
                     ("copy", "复制路径".into(), MenuCommand::CopyPath(shown), false),
                 ];
@@ -1623,6 +1624,7 @@ impl Launcher {
             MenuCommand::RenameCategory(name) => self.open_category_editor(Some(name), window, cx),
             MenuCommand::DeleteCategory(name) => self.delete_category(&name, cx),
             MenuCommand::CopyPath(path) => self.copy_path(&path, cx),
+            MenuCommand::Preview(path) => self.open_preview(path, None, cx),
             MenuCommand::AddProject(path) => self.add_project(&path, cx),
             MenuCommand::Download(id) => self.start_download(&id, false, cx),
             MenuCommand::Redownload(id) => self.redownload(&id, cx),
@@ -1677,93 +1679,6 @@ impl Launcher {
 }
 
 /// Minimal Markdown for AI answers: headings, bullets, fenced code blocks
-/// (with a copy button) and paragraphs; `**bold**` markers are dropped.
-fn render_markdown(text: &str, theme: &Theme, cx: &mut Context<Launcher>) -> Vec<AnyElement> {
-    let mut out = Vec::new();
-    let mut code: Option<Vec<String>> = None;
-    let mut code_ix = 0usize;
-    let flush_code = |lines: Vec<String>, ix: usize, out: &mut Vec<AnyElement>, cx: &mut Context<Launcher>| {
-        let joined = lines.join("\n");
-        out.push(
-            div()
-                .my(px(4.))
-                .relative()
-                .rounded(px(8.))
-                .bg(theme.kbd_bg)
-                .border_1()
-                .border_color(theme.border)
-                .p(px(10.))
-                .pr(px(64.))
-                .font_family("Consolas")
-                .text_size(px(12.5))
-                .line_height(px(19.))
-                .children(lines.into_iter().map(|l| div().child(if l.is_empty() { " ".to_string() } else { l })))
-                .child(
-                    div()
-                        .id(("copy-code", ix))
-                        .absolute()
-                        .top(px(6.))
-                        .right(px(6.))
-                        .px(px(8.))
-                        .py(px(2.))
-                        .rounded(px(6.))
-                        .font_family(".SystemUIFont")
-                        .text_size(px(11.5))
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.row_hover).text_color(theme.accent))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.copy_path(&joined, cx)))
-                        .child("复制"),
-                )
-                .into_any_element(),
-        );
-    };
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            match code.take() {
-                Some(lines) => {
-                    flush_code(lines, code_ix, &mut out, cx);
-                    code_ix += 1;
-                }
-                None => code = Some(Vec::new()),
-            }
-            continue;
-        }
-        if let Some(lines) = code.as_mut() {
-            lines.push(line.to_string());
-            continue;
-        }
-        let plain = line.replace("**", "");
-        let el = if trimmed.is_empty() {
-            div().h(px(6.))
-        } else if let Some(h) = trimmed.strip_prefix("### ").or_else(|| trimmed.strip_prefix("## ")).or_else(|| trimmed.strip_prefix("# ")) {
-            div()
-                .mt(px(4.))
-                .text_size(px(15.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(h.replace("**", ""))
-        } else if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
-            let indent = (line.len() - trimmed.len()) as f32 * 4.;
-            div()
-                .pl(px(4. + indent))
-                .flex()
-                .gap(px(8.))
-                .text_size(px(13.5))
-                .line_height(px(21.))
-                .child(div().flex_none().text_color(theme.accent).child("•"))
-                .child(div().flex_1().min_w_0().child(item.replace("**", "")))
-        } else {
-            div().text_size(px(13.5)).line_height(px(21.)).child(plain)
-        };
-        out.push(el.into_any_element());
-    }
-    // An unterminated fence while streaming still shows its code so far.
-    if let Some(lines) = code {
-        flush_code(lines, code_ix, &mut out, cx);
-    }
-    out
-}
 
 /// Icon that switches color while its `group` ancestor is hovered.
 pub fn icon_hover(name: &str, size: f32, color: Hsla, group: &'static str, hover: Hsla) -> gpui::Svg {
@@ -1781,6 +1696,7 @@ pub enum MenuCommand {
     RenameCategory(String),
     DeleteCategory(String),
     CopyPath(String),
+    Preview(std::path::PathBuf),
     AddProject(std::path::PathBuf),
     Download(String),
     Redownload(String),

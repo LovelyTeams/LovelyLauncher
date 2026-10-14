@@ -11,6 +11,8 @@ mod icon_image;
 mod icons;
 mod input;
 mod launcher;
+mod markdown;
+mod preview;
 mod search;
 mod system;
 mod theme;
@@ -55,6 +57,11 @@ fn main() {
         .run(move |cx: &mut App| {
             input::bind_keys(cx);
             launcher::bind_keys(cx);
+            preview::bind_keys(cx);
+            cx.set_global(preview::ffmpeg::FfmpegState {
+                path: preview::ffmpeg::find(&config.settings.ffmpeg_path),
+                ..Default::default()
+            });
             cx.set_global(Theme::from_settings(&config.settings, gpui::WindowAppearance::Light));
 
             let (tx, mut rx) = futures::channel::mpsc::unbounded::<AppEvent>();
@@ -63,6 +70,8 @@ fn main() {
             let hotkey_error = hotkeys.apply(&config.settings.hotkey).err();
             cx.set_global(hotkeys);
             cx.set_global(TrayHolder(system::create_tray(tx.clone())));
+            preview::hook::ENABLED.store(config.settings.space_preview, std::sync::atomic::Ordering::Relaxed);
+            preview::hook::start(tx.clone(), AppEvent::Preview);
             win::listen_for_show_requests({
                 let tx = tx.clone();
                 move || {

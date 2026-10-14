@@ -11,7 +11,8 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, POINT, RECT},
         Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
+            GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+            MonitorFromWindow, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
             GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
         },
         Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SearchPathW},
@@ -29,7 +30,7 @@ use windows::{
             HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI},
             Shell::{
                 SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SHFILEINFOW,
-                SHGFI_DISPLAYNAME, SHGFI_FLAGS, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
+                SHGFI_DISPLAYNAME, SHGFI_FLAGS, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
                 SHGetFileInfoW, SHGetImageList,
                 SHIL_EXTRALARGE, ShellExecuteExW,
             },
@@ -37,7 +38,7 @@ use windows::{
                 ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, DestroyIcon, GetIconInfo,
                 ICONINFO, IsIconic, IsWindowVisible, SPI_GETWORKAREA, SW_HIDE, SW_MAXIMIZE, SW_RESTORE,
                 SW_SHOW,
-                SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+                SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SWP_SHOWWINDOW,
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, GetClientRect, GetCursorPos, GetWindowRect,
                 IsZoomed, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
             },
@@ -185,6 +186,61 @@ pub fn place_mini(raw: isize, width: f32, height: f32) {
         let y = work.top + work_h / 5;
         let _ = SetWindowPos(h, None, x, y, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
     }
+}
+
+/// Show a window without activating it, centred on the monitor of `anchor`
+/// (or the cursor), with `width` x `height` logical pixels of content.
+pub fn place_window(raw: isize, width: f32, height: f32, anchor: Option<isize>) {
+    let h = hwnd(raw);
+    unsafe {
+        let monitor: HMONITOR = match anchor {
+            Some(a) => MonitorFromWindow(hwnd(a), MONITOR_DEFAULTTONEAREST),
+            None => {
+                let mut cursor = POINT::default();
+                let _ = GetCursorPos(&mut cursor);
+                MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+            }
+        };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x.max(96) as f32 / 96.;
+        let (dw, dh) = frame_delta(h);
+        let work = info.rcWork;
+        let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
+        let w = ((width * scale) as i32 + dw).min(work_w * 9 / 10);
+        let ht = ((height * scale) as i32 + dh).min(work_h * 9 / 10);
+        let x = work.left + (work_w - w) / 2;
+        let y = work.top + (work_h - ht) / 2;
+        let _ = SetWindowPos(h, None, x, y, w, ht, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+/// Explorer's description of a file type, e.g. "Markdown 源文件".
+pub fn type_name(path: &Path) -> Option<String> {
+    let wide = HSTRING::from(path.as_os_str());
+    let mut info = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            &wide,
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_TYPENAME,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = info.szTypeName.iter().position(|&c| c == 0).unwrap_or(info.szTypeName.len());
+    let name = String::from_utf16_lossy(&info.szTypeName[..len]);
+    (!name.is_empty()).then_some(name)
 }
 
 /// Resize the content height (logical pixels), keeping the top-left corner.
