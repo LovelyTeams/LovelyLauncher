@@ -57,8 +57,13 @@
 - 每个工具都能**上传自定义图标**，默认用程序自带图标
 - 主题色、背景色调、毛玻璃、不透明度都能调，还能逐项覆盖颜色
 
+**👀 空格快速预览**
+- 在资源管理器或桌面选中文件按**空格**即可预览，方向键切换、再按空格关闭
+- Markdown、图片、文本（自动识别 GBK）、Word、Excel、CSV / TSV、音频、视频
+
 **🪟 用着顺手**
 - `Alt+Space` 呼出**迷你搜索框**，一键还原完整窗口
+- 从 GitHub **自动更新**（SHA256 校验后原地替换）
 - 托盘常驻、开机自启、单实例、高分屏 / 高缩放自适应
 
 </td>
@@ -151,6 +156,33 @@ cargo build --release
 - **右键菜单**：打开、以管理员身份运行、收藏、编辑、打开文件位置、删除。
 - **预设下载**：LovelyMem、LovelySpark 第一次点开时会自动下载（卡片上显示进度），下载完自动启动；右键可以重新下载来更新。
 
+### 空格快速预览
+
+LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，按 **空格** 就会弹出预览窗口：
+
+- 预览窗口不会抢走焦点：继续按 **↑ ↓ ← →** 切换文件，预览会跟着变；再按 **空格** 或 **Esc** 关闭
+- 只在文件列表里生效，重命名、地址栏、搜索框里打字时空格照常输入
+- 搜索结果里的文件也可以右键“快速预览”
+- 可在 **设置 → 预览** 中关闭
+
+| 类型 | 格式 | 说明 |
+|---|---|---|
+| Markdown | `.md` | 完整渲染：标题、列表、任务列表、表格、代码块、本地图片 |
+| 图片 | png / jpg / gif / bmp / webp / ico / tiff / svg | GIF 支持动画 |
+| 文本与代码 | txt / log / json / yaml / 各类源码…… | 自动识别 UTF-8 / UTF-16 / GBK，大文件只读前 4 MB |
+| 表格 | `.csv` `.tsv` `.xlsx` | 行列号、多工作表切换，最多 10 万行 |
+| 文档 | `.docx` | 标题、加粗 / 斜体、列表、表格、内嵌图片 |
+| 音频 | mp3 / wav / wma / mid | Windows 自带，**无需额外安装** |
+| 音频（更多） | flac / ogg / opus / m4a / aac…… | 需要 FFmpeg |
+| 视频 | mp4 / mkv / mov / avi / webm…… | 需要 FFmpeg |
+| 文件夹 | — | 列出内容与大小 |
+
+**FFmpeg**：第一次预览视频时会提示，可以一键下载（来自 gyan.dev 的 essentials 版本，约 110 MB），也可以选择本机已有的 `ffmpeg.exe`；`PATH` 里有 ffmpeg 也会自动使用。
+
+### 自动更新
+
+启动后会在后台检查 [GitHub Releases](https://github.com/LovelyTeams/LovelyLauncher/releases) 是否有新版本（每天最多一次，可在设置中关闭）。发现新版本时设置按钮上会出现小红点，在 **设置 → 通用 → 关于与更新** 里点“下载并更新”：下载 → 用 `SHA256SUMS.txt` 校验 → 原地替换 → 自动重启。
+
 ### 迷你搜索框
 
 热键默认弹出一个只有输入框的小窗口，出现在鼠标所在显示器的偏上位置。打字后在下方展开结果，点“还原窗口”会回到完整界面，并恢复原来的位置和大小。点到别处时它会自动收起。不喜欢的话可以在 **设置 → 通用** 里关掉，热键就会直接打开完整窗口。
@@ -199,7 +231,7 @@ cargo build --release
 
 - 默认位置：`%APPDATA%\LovelyLauncher\config.json`（设置页左下角“打开配置文件夹”可以直接打开）
 - 设置环境变量 **`LOVELYLAUNCHER_DATA`** 可以把数据放到别的目录，适合便携使用
-- 自定义图标保存在数据目录的 `icons\` 下；预设程序下载到 `%LOCALAPPDATA%\LovelyLauncher\apps\`
+- 自定义图标保存在数据目录的 `icons\` 下；预设程序下载到 `%LOCALAPPDATA%\LovelyLauncher\apps\`，FFmpeg 下载到 `%LOCALAPPDATA%\LovelyLauncher\tools\`
 - 配置文件可以手动编辑（带不带 BOM 都行）；旧版本的配置会自动迁移
 
 ## 📊 性能
@@ -221,7 +253,10 @@ cargo build --release
 | `src/main.rs` | 启动、单实例、窗口创建、事件分发 |
 | `src/launcher.rs` | 核心状态与逻辑：搜索、启动、下载、分类、迷你模式、AI 会话 |
 | `src/view.rs` | 主界面渲染：仪表盘、图标格子、搜索结果、迷你框、AI 面板 |
-| `src/dialogs.rs` | 编辑工具、设置（通用 / 外观 / AI / 搜索）、分类对话框 |
+| `src/dialogs.rs` | 编辑工具、设置（通用 / 外观 / 预览 / AI / 搜索）、分类对话框 |
+| `src/preview/` | 空格预览：键盘钩子与选中文件读取（`hook.rs`）、预览窗口（`mod.rs`）、Office / CSV / 编码（`office.rs`）、播放器（`media.rs`）、FFmpeg（`ffmpeg.rs`） |
+| `src/markdown.rs` | Markdown 渲染（预览与 AI 回答共用） |
+| `src/update.rs` | 从 GitHub Releases 自动更新 |
 | `src/input.rs` | 支持输入法（IME）的单行输入框 |
 | `src/search.rs` | 模糊匹配与拼音搜索 |
 | `src/ai.rs` · `src/http.rs` | AI 接口（OpenAI 兼容 / Anthropic）与 WinHTTP 客户端 |

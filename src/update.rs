@@ -181,6 +181,12 @@ pub fn finish_after_update(old_pid: u32) {
             let _ = CloseHandle(handle);
         }
     }
+    remove_leftover();
+}
+
+/// Delete the previous exe kept aside by an update. Also run on every start,
+/// since a version that predates the updater won't clean up after itself.
+pub fn remove_leftover() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = fs::remove_file(exe.with_extension("old"));
     }

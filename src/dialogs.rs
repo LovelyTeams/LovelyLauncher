@@ -1466,12 +1466,12 @@ impl Launcher {
         let update = &self.update;
         let busy = update.checking || update.progress.is_some();
         let available = update.available.as_ref();
+        // First few lines of the release notes, rendered as Markdown.
         let notes: Option<String> = available.map(|i| {
             i.notes
                 .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('>'))
-                .take(4)
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .take(6)
                 .collect::<Vec<_>>()
                 .join("\n")
         });
@@ -1542,9 +1542,11 @@ impl Launcher {
                         .p(px(10.))
                         .rounded(px(8.))
                         .bg(theme.kbd_bg)
-                        .text_size(px(12.))
                         .text_color(theme.text_muted)
-                        .children(notes.lines().map(|l| div().child(l.to_string())).collect::<Vec<_>>()),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(crate::markdown::render(&notes, None, theme)),
                 )
             })
             .into_any_element()

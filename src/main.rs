@@ -43,7 +43,10 @@ fn main() {
             update::finish_after_update(pid);
             true
         }
-        None => false,
+        None => {
+            update::remove_leftover();
+            false
+        }
     };
     if let win::Instance::Secondary = win::acquire_single_instance() {
         // The running instance has been asked to show itself.
