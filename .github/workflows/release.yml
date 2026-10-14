@@ -1,0 +1,120 @@
+# Build, test, UPX-compress and publish LovelyLauncher.
+#
+#   Release:  bump `version` in Cargo.toml, commit, then
+#             git tag v0.2.0 && git push origin v0.2.0
+#             (tags with a hyphen, e.g. v0.2.0-beta.1, become pre-releases)
+#   Dry run:  Actions → Release → Run workflow (builds and uploads an artifact,
+#             no GitHub Release is created)
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP: LovelyLauncher
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          if ($tag -ne $version) {
+            throw "Tag v$tag does not match Cargo.toml version $version"
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          install-only: true
+
+      - name: Compress with UPX
+        id: upx
+        shell: pwsh
+        run: |
+          $exe = "target/release/$env:APP.exe"
+          $before = (Get-Item $exe).Length
+          upx --best --lzma $exe
+          upx -t $exe   # verify the packed binary unpacks cleanly
+          $after = (Get-Item $exe).Length
+          "before=$([math]::Round($before / 1MB, 2))" >> $env:GITHUB_OUTPUT
+          "after=$([math]::Round($after / 1MB, 2))" >> $env:GITHUB_OUTPUT
+          Write-Host ("UPX: {0:N2} MB -> {1:N2} MB ({2:P0})" -f ($before / 1MB), ($after / 1MB), ($after / $before))
+
+      - name: Smoke test packed exe
+        shell: pwsh
+        run: |
+          # The app runs until quit, so just make sure it starts and stays up.
+          $env:LOVELYLAUNCHER_DATA = "$env:RUNNER_TEMP\lovely-smoke"
+          $p = Start-Process "target/release/$env:APP.exe" -ArgumentList "--hidden" -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) { throw "Packed exe exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $label = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-$("${{ github.sha }}".Substring(0, 7))" }
+          $name = "$env:APP-$label-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/release/$env:APP.exe" "dist/$name.exe"
+          Compress-Archive -Path "dist/$name.exe", README.md -DestinationPath "dist/$name.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.APP }} ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ### 下载
+
+            - **`${{ steps.package.outputs.name }}.exe`**：单文件，下载后直接运行
+            - `${{ steps.package.outputs.name }}.zip`：exe 加 README
+            - `SHA256SUMS.txt`：文件校验值
+
+            exe 已用 UPX 压缩：${{ steps.upx.outputs.before }} MB → **${{ steps.upx.outputs.after }} MB**。
+
+            > 首次运行若出现 SmartScreen 提示，点“更多信息 → 仍要运行”即可（程序没有代码签名）。

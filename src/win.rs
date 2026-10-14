@@ -1,0 +1,634 @@
+//! Thin Win32 helpers: window show/hide, launching, icon extraction,
+//! Start Menu scanning, single-instance signalling and autostart.
+
+use std::{
+    collections::HashSet,
+    ffi::c_void,
+    path::{Path, PathBuf},
+};
+
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, POINT, RECT},
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
+            GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
+        },
+        Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SearchPathW},
+        System::{
+            Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+            Environment::ExpandEnvironmentStringsW,
+            ProcessStatus::EmptyWorkingSet,
+            Threading::{
+                CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcess, INFINITE,
+                OpenEventW, SetEvent, WaitForSingleObject,
+            },
+        },
+        UI::{
+            Controls::IImageList,
+            HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI},
+            Shell::{
+                SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SHFILEINFOW,
+                SHGFI_DISPLAYNAME, SHGFI_FLAGS, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
+                SHGetFileInfoW, SHGetImageList,
+                SHIL_EXTRALARGE, ShellExecuteExW,
+            },
+            WindowsAndMessaging::{
+                ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, DestroyIcon, GetIconInfo,
+                ICONINFO, IsIconic, IsWindowVisible, SPI_GETWORKAREA, SW_HIDE, SW_MAXIMIZE, SW_RESTORE,
+                SW_SHOW,
+                SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, GetClientRect, GetCursorPos, GetWindowRect,
+                IsZoomed, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
+            },
+        },
+    },
+    core::{HSTRING, PCWSTR},
+};
+
+const MUTEX_NAME: &str = "Local\\LovelyLauncher.SingleInstance";
+const SHOW_EVENT_NAME: &str = "Local\\LovelyLauncher.Show";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "LovelyLauncher";
+
+fn hwnd(raw: isize) -> HWND {
+    HWND(raw as *mut c_void)
+}
+
+// ---------------------------------------------------------------------------
+// Window visibility
+
+pub fn show_window(raw: isize) {
+    let h = hwnd(raw);
+    unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(h, SW_SHOW);
+        }
+        let _ = BringWindowToTop(h);
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+pub fn hide_window(raw: isize) {
+    unsafe {
+        let _ = ShowWindow(hwnd(raw), SW_HIDE);
+    }
+}
+
+pub fn is_window_visible(raw: isize) -> bool {
+    let h = hwnd(raw);
+    unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
+}
+
+/// Primary monitor work area (excluding the taskbar) in logical pixels: (x, y, w, h).
+pub fn primary_work_area() -> Option<(f32, f32, f32, f32)> {
+    let mut rect = RECT::default();
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut RECT as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .ok()?;
+        let scale = GetDpiForSystem().max(96) as f32 / 96.;
+        Some((
+            rect.left as f32 / scale,
+            rect.top as f32 / scale,
+            (rect.right - rect.left) as f32 / scale,
+            (rect.bottom - rect.top) as f32 / scale,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window geometry (physical pixels unless noted)
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub maximized: bool,
+}
+
+pub fn window_rect(raw: isize) -> Option<WindowRect> {
+    let h = hwnd(raw);
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(h, &mut r) }.ok()?;
+    Some(WindowRect {
+        x: r.left,
+        y: r.top,
+        w: r.right - r.left,
+        h: r.bottom - r.top,
+        maximized: unsafe { IsZoomed(h).as_bool() },
+    })
+}
+
+pub fn set_window_rect(raw: isize, rect: WindowRect) {
+    let h = hwnd(raw);
+    unsafe {
+        if IsZoomed(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetWindowPos(h, None, rect.x, rect.y, rect.w, rect.h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if rect.maximized {
+            let _ = ShowWindow(h, SW_MAXIMIZE);
+        }
+    }
+}
+
+/// Window size minus client size: the invisible resize borders around our content.
+fn frame_delta(h: HWND) -> (i32, i32) {
+    let (mut wr, mut cr) = (RECT::default(), RECT::default());
+    unsafe {
+        if GetWindowRect(h, &mut wr).is_err() || GetClientRect(h, &mut cr).is_err() {
+            return (0, 0);
+        }
+    }
+    (
+        (wr.right - wr.left) - (cr.right - cr.left),
+        (wr.bottom - wr.top) - (cr.bottom - cr.top),
+    )
+}
+
+/// Place the window as a compact bar: `width` x `height` logical pixels of content,
+/// centred horizontally, a fifth of the way down the monitor under the cursor.
+pub fn place_mini(raw: isize, width: f32, height: f32) {
+    let h = hwnd(raw);
+    unsafe {
+        if IsZoomed(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x.max(96) as f32 / 96.;
+        let (dw, dh) = frame_delta(h);
+        let work = info.rcWork;
+        let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
+        let w = ((width * scale) as i32 + dw).min(work_w);
+        let ht = (height * scale) as i32 + dh;
+        let x = work.left + (work_w - w) / 2;
+        let y = work.top + work_h / 5;
+        let _ = SetWindowPos(h, None, x, y, w, ht, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Resize the content height (logical pixels), keeping the top-left corner.
+pub fn set_content_height(raw: isize, height: f32) {
+    let h = hwnd(raw);
+    let Some(rect) = window_rect(raw) else { return };
+    let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(h) }.max(96) as f32 / 96.;
+    let (_, dh) = frame_delta(h);
+    let ht = (height * scale) as i32 + dh;
+    if ht != rect.h {
+        unsafe {
+            let _ = SetWindowPos(h, None, 0, 0, rect.w, ht, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+        }
+    }
+}
+
+/// Return the process's resident pages to the OS while we sit hidden in the tray.
+pub fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Launching
+
+pub fn init_com() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+}
+
+pub fn expand_env(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let src = HSTRING::from(s);
+    unsafe {
+        let needed = ExpandEnvironmentStringsW(&src, None);
+        if needed == 0 {
+            return s.to_string();
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = ExpandEnvironmentStringsW(&src, Some(&mut buf));
+        if written == 0 {
+            return s.to_string();
+        }
+        String::from_utf16_lossy(&buf[..written as usize - 1])
+    }
+}
+
+/// Launch a file, folder, URL or shell URI through the shell.
+/// Blocking; call from a background thread.
+pub fn shell_execute(target: &str, args: &str, workdir: &str, admin: bool) -> Result<(), String> {
+    init_com();
+    let target = expand_env(target.trim());
+    let workdir = expand_env(workdir.trim());
+    let file = HSTRING::from(target.as_str());
+    let params = HSTRING::from(args);
+    let dir = HSTRING::from(workdir.as_str());
+    let verb = HSTRING::from(if admin { "runas" } else { "open" });
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: if args.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(params.as_ptr())
+        },
+        lpDirectory: if workdir.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(dir.as_ptr())
+        },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| {
+        let msg = e.message();
+        if msg.is_empty() {
+            format!("无法启动 {target}")
+        } else {
+            format!("无法启动 {target}：{msg}")
+        }
+    })
+}
+
+/// Resolve a bare program name ("taskmgr.exe") to a full path via the search path.
+pub fn search_path(name: &str) -> Option<PathBuf> {
+    let name = HSTRING::from(name);
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe { SearchPathW(PCWSTR::null(), &name, PCWSTR::null(), Some(&mut buf), None) };
+    if len == 0 || len as usize >= buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+}
+
+/// Resolve a launch target to a filesystem path suitable for icon lookup.
+pub fn resolve_target_path(target: &str) -> Option<PathBuf> {
+    let target = expand_env(target.trim().trim_matches('"'));
+    if target.is_empty() || target.contains("://") || target.ends_with(':') {
+        return None;
+    }
+    let path = PathBuf::from(&target);
+    if path.is_absolute() {
+        return path.exists().then_some(path);
+    }
+    search_path(&target)
+}
+
+/// The file whose icon best represents `path`. MMC snap-ins (.msc) only carry a
+/// generic document icon, so prefer a same-named launcher exe, else mmc.exe.
+pub fn icon_source(path: &Path) -> PathBuf {
+    let is_msc = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("msc"));
+    if is_msc {
+        let exe = path
+            .file_stem()
+            .map(|stem| format!("{}.exe", stem.to_string_lossy()));
+        if let Some(found) = exe.and_then(|exe| search_path(&exe)).or_else(|| search_path("mmc.exe")) {
+            return found;
+        }
+    }
+    path.to_path_buf()
+}
+
+pub fn detect_terminal() -> String {
+    if search_path("wt.exe").is_some() {
+        "wt.exe".into()
+    } else if search_path("pwsh.exe").is_some() {
+        "pwsh.exe".into()
+    } else {
+        "powershell.exe".into()
+    }
+}
+
+/// Arguments to open `terminal` in `dir`.
+pub fn terminal_args_for_dir(terminal: &str, dir: &str) -> String {
+    let lower = terminal.to_ascii_lowercase();
+    if lower.ends_with("wt.exe") || lower == "wt" {
+        format!("-d \"{dir}\"")
+    } else {
+        String::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+
+/// A 32-bit BGRA bitmap with straight alpha.
+pub struct IconBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// Extract the shell's 48px icon for a file, folder or shortcut.
+/// Blocking; call from a background thread.
+pub fn file_icon(path: &Path) -> Option<IconBitmap> {
+    shell_icon(path, SHGFI_SYSICONINDEX)
+}
+
+/// The generic icon for files with extension `ext` (e.g. "pdf"); the file need not exist.
+pub fn file_type_icon(ext: &str) -> Option<IconBitmap> {
+    shell_icon(Path::new(&format!("file.{ext}")), SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)
+}
+
+fn shell_icon(path: &Path, flags: SHGFI_FLAGS) -> Option<IconBitmap> {
+    init_com();
+    let wide = HSTRING::from(path.as_os_str());
+    let mut info = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            &wide,
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            flags,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    unsafe {
+        let list: IImageList = SHGetImageList(SHIL_EXTRALARGE as i32).ok()?;
+        // ILD_TRANSPARENT = 1
+        let icon = list.GetIcon(info.iIcon, 1).ok()?;
+        let bitmap = hicon_to_bitmap(icon);
+        let _ = DestroyIcon(icon);
+        bitmap
+    }
+}
+
+unsafe fn hicon_to_bitmap(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<IconBitmap> {
+    unsafe {
+        let mut ii = ICONINFO::default();
+        GetIconInfo(icon, &mut ii).ok()?;
+        let color = ii.hbmColor;
+        let mask = ii.hbmMask;
+        let result = (|| {
+            if color.is_invalid() {
+                return None;
+            }
+            let (w, h) = bitmap_size(color)?;
+            let mut bgra = read_bits(color, w, h)?;
+            // Legacy icons have no alpha channel: derive it from the AND mask.
+            if bgra.chunks_exact(4).all(|p| p[3] == 0) {
+                let mask_bits = read_bits(mask, w, h)?;
+                for (px, m) in bgra.chunks_exact_mut(4).zip(mask_bits.chunks_exact(4)) {
+                    px[3] = if m[0] == 0 { 255 } else { 0 };
+                }
+            }
+            Some(IconBitmap {
+                width: w as u32,
+                height: h as u32,
+                bgra,
+            })
+        })();
+        if !color.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(color.0));
+        }
+        if !mask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(mask.0));
+        }
+        result
+    }
+}
+
+unsafe fn bitmap_size(bmp: HBITMAP) -> Option<(i32, i32)> {
+    let mut bm = BITMAP::default();
+    let n = unsafe {
+        GetObjectW(
+            HGDIOBJ(bmp.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut c_void),
+        )
+    };
+    (n != 0 && bm.bmWidth > 0 && bm.bmHeight > 0).then_some((bm.bmWidth, bm.bmHeight))
+}
+
+unsafe fn read_bits(bmp: HBITMAP, w: i32, h: i32) -> Option<Vec<u8>> {
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    unsafe {
+        let dc = GetDC(None);
+        let lines = GetDIBits(
+            dc,
+            bmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(None, dc);
+        (lines == h).then_some(buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Start Menu
+
+#[derive(Clone, Debug)]
+pub struct InstalledApp {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Enumerate shortcuts in the per-user and all-users Start Menu.
+/// Blocking; call from a background thread.
+pub fn scan_start_menu() -> Vec<InstalledApp> {
+    init_com();
+    let mut roots = Vec::new();
+    for var in ["APPDATA", "PROGRAMDATA"] {
+        if let Some(base) = std::env::var_os(var) {
+            roots.push(PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs"));
+        }
+    }
+
+    let mut files = Vec::new();
+    for root in roots {
+        walk(&root, 0, &mut files);
+    }
+
+    let mut seen = HashSet::new();
+    let mut apps = Vec::new();
+    for path in files {
+        let name = display_name(&path).unwrap_or_else(|| {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let lower = name.to_lowercase();
+        if name.is_empty()
+            || ["uninstall", "卸载", "readme", "license", "帮助", "help"]
+                .iter()
+                .any(|bad| lower.contains(bad))
+        {
+            continue;
+        }
+        if seen.insert(lower) {
+            apps.push(InstalledApp { name, path });
+        }
+    }
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps
+}
+
+fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk(&path, depth + 1, out);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "lnk" | "url" | "appref-ms"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Localized shell display name (honours desktop.ini LocalizedFileNames).
+fn display_name(path: &Path) -> Option<String> {
+    let wide = HSTRING::from(path.as_os_str());
+    let mut info = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            &wide,
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_DISPLAYNAME,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = info
+        .szDisplayName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(info.szDisplayName.len());
+    let name = String::from_utf16_lossy(&info.szDisplayName[..len]);
+    // Display names keep the extension for .url / .appref-ms when extensions are shown.
+    let name = name
+        .strip_suffix(".lnk")
+        .or_else(|| name.strip_suffix(".url"))
+        .or_else(|| name.strip_suffix(".appref-ms"))
+        .unwrap_or(&name)
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+// ---------------------------------------------------------------------------
+// Single instance
+
+pub enum Instance {
+    Primary,
+    /// Another instance is running and has been asked to show itself.
+    Secondary,
+}
+
+pub fn acquire_single_instance() -> Instance {
+    unsafe {
+        let mutex = CreateMutexW(None, true, &HSTRING::from(MUTEX_NAME));
+        if mutex.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(SHOW_EVENT_NAME)) {
+                // Let the primary instance take the foreground.
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = SetEvent(event);
+                let _ = CloseHandle(event);
+            }
+            return Instance::Secondary;
+        }
+        // Intentionally leak the mutex handle: it must live for the whole process.
+        Instance::Primary
+    }
+}
+
+/// Spawn a thread that calls `on_show` whenever a second instance is started.
+pub fn listen_for_show_requests(on_show: impl Fn() + Send + 'static) {
+    let event = unsafe { CreateEventW(None, false, false, &HSTRING::from(SHOW_EVENT_NAME)) };
+    let Ok(event) = event else { return };
+    let raw = event.0 as isize;
+    std::thread::Builder::new()
+        .name("show-listener".into())
+        .spawn(move || {
+            let event = HANDLE(raw as *mut c_void);
+            loop {
+                unsafe { WaitForSingleObject(event, INFINITE) };
+                on_show();
+            }
+        })
+        .ok();
+}
+
+// ---------------------------------------------------------------------------
+// Autostart
+
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    let key = windows_registry::CURRENT_USER
+        .create(RUN_KEY)
+        .map_err(|e| e.to_string())?;
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        key.set_string(RUN_VALUE, format!("\"{}\" --hidden", exe.display()))
+            .map_err(|e| e.to_string())
+    } else {
+        match key.remove_value(RUN_VALUE) {
+            Ok(()) => Ok(()),
+            Err(_) if !is_autostart() => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+pub fn is_autostart() -> bool {
+    windows_registry::CURRENT_USER
+        .open(RUN_KEY)
+        .and_then(|k| k.get_string(RUN_VALUE))
+        .is_ok()
+}

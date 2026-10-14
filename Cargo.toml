@@ -1,0 +1,54 @@
+[package]
+name = "lovely-launcher"
+version = "0.1.0"
+edition = "2024"
+description = "LovelyLauncher - a lightweight, fast tool launcher built with GPUI"
+
+[[bin]]
+name = "LovelyLauncher"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "bmp", "gif", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+global-hotkey = "0.8.0"
+tray-icon = { version = "0.26.1", default-features = false }
+pinyin = "0.11"
+raw-window-handle = "0.6"
+unicode-segmentation = "1"
+windows-registry = "0.5"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-resource = "3.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
