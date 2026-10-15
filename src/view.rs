@@ -1147,7 +1147,7 @@ impl Launcher {
             .flex_col()
             .child(header)
             .when(rows.is_empty(), |d| {
-                d.child(Self::empty_hint("把文件夹拖进窗口，或按 Ctrl+O 打开项目", theme))
+                d.child(Self::empty_hint("用 Ctrl+O 打开过的项目会显示在这里", theme))
             })
             .children(rows)
     }

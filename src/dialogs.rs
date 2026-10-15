@@ -27,6 +27,8 @@ pub enum Dialog {
 /// What 快速扫码 found.
 pub struct ScanResults {
     codes: Vec<crate::scan::Code>,
+    /// Each code's picture, so it is clear which text came from which code.
+    thumbs: Vec<Option<std::sync::Arc<gpui::RenderImage>>>,
     /// Which result was last copied.
     copied: Option<usize>,
     focus: FocusHandle,
@@ -34,7 +36,15 @@ pub struct ScanResults {
 
 impl ScanResults {
     pub fn new(codes: Vec<crate::scan::Code>, copied: Option<usize>, focus: FocusHandle) -> Self {
-        Self { codes, copied, focus }
+        let thumbs = codes
+            .iter()
+            .map(|c| {
+                let (w, h, px) = c.thumb.clone()?;
+                let img = image::RgbaImage::from_raw(w, h, px)?;
+                Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(img)])))
+            })
+            .collect();
+        Self { codes, thumbs, copied, focus }
     }
 }
 
@@ -1104,6 +1114,7 @@ impl Launcher {
                     .child(icon(icon_name, 13., if on { theme.accent } else { theme.text_muted }))
                     .child(label)
             };
+            let thumb = results.thumbs.get(ix).cloned().flatten();
             div()
                 .p(px(12.))
                 .rounded(px(12.))
@@ -1111,8 +1122,30 @@ impl Launcher {
                 .border_color(theme.border)
                 .bg(theme.panel)
                 .flex()
-                .flex_col()
-                .gap(px(8.))
+                .gap(px(12.))
+                // The code itself, to match the text to it.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(96.))
+                        .h(px(88.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(gpui::white())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden()
+                        .children(thumb.map(|t| gpui::img(t).max_w(px(92.)).max_h(px(84.)).object_fit(gpui::ObjectFit::Contain))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
                 .child(
                     div()
                         .flex()
@@ -1128,6 +1161,7 @@ impl Launcher {
                                 .text_size(px(11.5))
                                 .child(code.kind.clone()),
                         )
+                        .child(div().text_size(px(11.5)).text_color(theme.text_faint).child(format!("来自{}", code.source)))
                         .child(div().flex_1())
                         .when_some(link, |d, url| {
                             d.child(small_button(("scan-open", ix), "打开链接".into(), "external", false).on_click(cx.listener(
@@ -1147,7 +1181,8 @@ impl Launcher {
                                 })),
                         ),
                 )
-                .child(div().text_size(px(13.5)).line_height(px(20.)).child(code.text.clone()))
+                .child(div().text_size(px(13.5)).line_height(px(20.)).child(code.text.clone())),
+                )
         });
         div()
             .flex()

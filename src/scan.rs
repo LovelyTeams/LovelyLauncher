@@ -3,7 +3,7 @@
 
 use std::ffi::c_void;
 
-use rxing::{BarcodeFormat, helpers::detect_multiple_in_luma};
+use rxing::{BarcodeFormat, Point, helpers::detect_multiple_in_luma};
 use windows::Win32::{
     Foundation::{HGLOBAL, LPARAM, RECT, TRUE},
     Graphics::Gdi::{
@@ -19,11 +19,15 @@ use windows::Win32::{
 use windows::core::{BOOL, w};
 
 /// One decoded code.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Code {
     /// "二维码", "条形码（EAN-13）", …
     pub kind: String,
     pub text: String,
+    /// Where it was found: "剪贴板图片", "屏幕 1", …
+    pub source: String,
+    /// A grey picture of the code (width, height, BGRA), so results can be told apart.
+    pub thumb: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl Code {
@@ -37,27 +41,82 @@ impl Code {
 pub fn scan_all() -> Vec<Code> {
     let mut codes = Vec::new();
     if let Some((luma, w, h)) = clipboard_image() {
-        codes.extend(decode(luma, w, h));
+        codes.extend(decode(luma, w, h, "剪贴板图片"));
     }
-    for (luma, w, h) in capture_monitors() {
-        codes.extend(decode(luma, w, h));
+    let screens = capture_monitors();
+    let several = screens.len() > 1;
+    for (i, (luma, w, h)) in screens.into_iter().enumerate() {
+        let source = if several { format!("屏幕 {}", i + 1) } else { "屏幕".to_string() };
+        codes.extend(decode(luma, w, h, &source));
     }
+    // The same code twice (say on screen and copied too) is listed once.
     let mut unique: Vec<Code> = Vec::new();
     for code in codes {
-        if !unique.contains(&code) {
+        if !unique.iter().any(|u| u.kind == code.kind && u.text == code.text) {
             unique.push(code);
         }
     }
     unique
 }
 
-fn decode(luma: Vec<u8>, width: u32, height: u32) -> Vec<Code> {
+fn decode(luma: Vec<u8>, width: u32, height: u32, source: &str) -> Vec<Code> {
+    // The reader takes the pixels; keep a copy to cut the thumbnails from.
+    let pixels = luma.clone();
     detect_multiple_in_luma(luma, width, height)
         .unwrap_or_default()
         .into_iter()
         .filter(|r| !r.getText().trim().is_empty())
-        .map(|r| Code { kind: kind_name(r.getBarcodeFormat()), text: r.getText().to_string() })
+        .map(|r| Code {
+            kind: kind_name(r.getBarcodeFormat()),
+            text: r.getText().to_string(),
+            source: source.to_string(),
+            thumb: thumbnail(&pixels, width, height, r.getPoints()),
+        })
         .collect()
+}
+
+/// Cut the code out of the image around the points the reader reported (finder
+/// pattern centres for 2D codes, the scan line for barcodes) and shrink it.
+fn thumbnail(luma: &[u8], width: u32, height: u32, points: &[Point]) -> Option<(u32, u32, Vec<u8>)> {
+    if points.is_empty() {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in points {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    let (w, h) = (x1 - x0, y1 - y0);
+    let (x0, y0, x1, y1) = if h < w * 0.2 {
+        // A barcode is reported as one scan line: follow its bars up and down.
+        let (top, bottom) = bar_extent(luma, width, height, x0, x1, (y0 + y1) / 2.);
+        let pad = 10. + w * 0.04;
+        (x0 - pad, top - 8., x1 + pad, bottom + 8.)
+    } else {
+        // Finder pattern centres sit inside the code; widen by a share of its size.
+        let pad = w.max(h) * 0.25 + 6.;
+        (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+    };
+    let x0 = x0.max(0.) as u32;
+    let y0 = y0.max(0.) as u32;
+    let x1 = (x1.min(width as f32) as u32).max(x0 + 1);
+    let y1 = (y1.min(height as f32) as u32).max(y0 + 1);
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut crop = image::GrayImage::new(cw, ch);
+    for y in 0..ch {
+        let row = ((y0 + y) * width + x0) as usize;
+        for x in 0..cw {
+            crop.put_pixel(x, y, image::Luma([*luma.get(row + x as usize)?]));
+        }
+    }
+    // Fit within 120 x 88.
+    let scale = (120. / cw as f32).min(88. / ch as f32).min(1.);
+    let (tw, th) = (((cw as f32 * scale) as u32).max(1), ((ch as f32 * scale) as u32).max(1));
+    let small = image::imageops::resize(&crop, tw, th, image::imageops::FilterType::Triangle);
+    let bgra = small.pixels().flat_map(|p| [p.0[0], p.0[0], p.0[0], 255]).collect();
+    Some((tw, th, bgra))
 }
 
 fn kind_name(format: &BarcodeFormat) -> String {
@@ -86,6 +145,32 @@ fn barcode_name(format: &BarcodeFormat) -> String {
         BarcodeFormat::RSS_EXPANDED => "GS1 DataBar Expanded".into(),
         other => other.to_string().to_uppercase(),
     }
+}
+
+/// Rows above and below `y` that look like the same bars (between `x0` and `x1`).
+fn bar_extent(luma: &[u8], width: u32, height: u32, x0: f32, x1: f32, y: f32) -> (f32, f32) {
+    let (x0, x1) = (x0.max(0.) as usize, (x1.min(width as f32) as usize).max(x0.max(0.) as usize + 1));
+    let row = |y: u32| -> Option<&[u8]> {
+        let start = y as usize * width as usize;
+        luma.get(start + x0..start + x1)
+    };
+    let mid = (y.max(0.) as u32).min(height.saturating_sub(1));
+    let Some(reference) = row(mid) else { return (y, y) };
+    let similar = |y: u32| {
+        row(y).is_some_and(|r| {
+            let diff: u32 = r.iter().zip(reference).map(|(a, b)| a.abs_diff(*b) as u32).sum();
+            diff / (r.len() as u32).max(1) < 48
+        })
+    };
+    let limit = (x1 - x0) as u32;
+    let (mut top, mut bottom) = (mid, mid);
+    while top > 0 && mid - top < limit && similar(top - 1) {
+        top -= 1;
+    }
+    while bottom + 1 < height && bottom - mid < limit && similar(bottom + 1) {
+        bottom += 1;
+    }
+    (top as f32, bottom as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +317,7 @@ mod tests {
                 }
             }
         }
-        decode(luma, iw, ih)
+        decode(luma, iw, ih, "测试")
     }
 
     #[test]
@@ -240,6 +325,11 @@ mod tests {
         let qr = round_trip("https://github.com/LovelyTeams/LovelyLauncher 你好", BarcodeFormat::QR_CODE, 240, 240);
         assert_eq!(qr.len(), 1);
         assert_eq!(qr[0].kind, "二维码");
+        // The thumbnail is the code, not the whole picture: mostly black and white.
+        let (tw, th, px) = qr[0].thumb.clone().unwrap();
+        assert!(tw > 20 && th > 20 && tw <= 120 && th <= 88);
+        let dark = px.chunks(4).filter(|p| p[0] < 128).count();
+        assert!(dark * 5 > px.len() / 4, "thumbnail should contain the code");
         assert_eq!(qr[0].text, "https://github.com/LovelyTeams/LovelyLauncher 你好");
         assert!(qr[0].is_link());
 
@@ -247,6 +337,8 @@ mod tests {
         assert_eq!(ean.len(), 1);
         assert_eq!(ean[0].text, "5901234123457");
         assert_eq!(ean[0].kind, "条形码（EAN-13）");
+        let (tw, th, _) = ean[0].thumb.clone().unwrap();
+        assert!(tw > th, "a barcode thumbnail is wide: {tw}x{th}");
     }
 
     #[test]

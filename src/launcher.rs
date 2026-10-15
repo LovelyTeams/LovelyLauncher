@@ -2438,7 +2438,7 @@ impl Launcher {
     }
 
     pub fn on_drop_paths(&mut self, paths: &ExternalPaths, _window: &mut Window, cx: &mut Context<Self>) {
-        let (mut tools, mut projects) = (0, 0);
+        let mut tools = 0;
         // New tools land in the tab that is open: its category, or the ring.
         let category = match &self.tool_filter {
             ToolFilter::Category(c) => c.clone(),
@@ -2449,26 +2449,21 @@ impl Launcher {
             _ => 0,
         };
         for path in paths.paths() {
-            if path.is_dir() {
-                self.config.touch_project(path);
-                projects += 1;
-            } else {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let ring = ring_room > 0;
-                ring_room = ring_room.saturating_sub(1);
-                self.config.tools.push(Tool {
-                    name,
-                    target: path.display().to_string(),
-                    color: "pink".into(),
-                    category: category.clone(),
-                    ring,
-                    ..Default::default()
-                });
-                tools += 1;
-            }
+            // Folders and files alike become tools (a folder opens in Explorer).
+            let name = if path.is_dir() { path.file_name() } else { path.file_stem() }
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let ring = ring_room > 0;
+            ring_room = ring_room.saturating_sub(1);
+            self.config.tools.push(Tool {
+                name,
+                target: path.display().to_string(),
+                color: "pink".into(),
+                category: category.clone(),
+                ring,
+                ..Default::default()
+            });
+            tools += 1;
         }
         self.config.save();
         let place = match &self.tool_filter {
@@ -2476,11 +2471,7 @@ impl Launcher {
             ToolFilter::Ring => "到圆环".to_string(),
             _ => String::new(),
         };
-        let msg = match (tools, projects) {
-            (0, p) => format!("已添加 {p} 个项目"),
-            (t, 0) => format!("已添加 {t} 个工具{place}"),
-            (t, p) => format!("已添加 {t} 个工具{place}和 {p} 个项目"),
-        };
+        let msg = format!("已添加 {tools} 个工具{place}");
         self.show_toast(msg, false, cx);
     }
 
