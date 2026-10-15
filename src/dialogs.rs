@@ -328,9 +328,9 @@ impl Launcher {
         let editor = ToolEditor {
             id: id.filter(|id| self.config.tools.iter().any(|t| &t.id == id)),
             name: new_input(cx, "例如：任务管理器", &tool.name),
-            target: new_input(cx, "程序路径、网址、文件夹，或 ms-settings: 之类的协议", &tool.target),
-            args: new_input(cx, "可选", &tool.args),
-            workdir: new_input(cx, "可选", &tool.workdir),
+            target: new_input(cx, "程序路径、网址、文件夹、协议，也可以粘贴整行命令", &tool.target),
+            args: new_input(cx, "可选（粘贴整行命令时会自动拆到这里）", &tool.args),
+            workdir: new_input(cx, "可选，相当于快捷方式的“起始位置”；留空则为程序所在文件夹", &tool.workdir),
             description: new_input(cx, "一句话介绍这个工具（可选）", &tool.description),
             download_url: new_input(cx, "可选：目标文件不存在时，先从这里下载", &tool.download_url),
             category: new_input(cx, "未分类（输入新名称会自动创建分类）", &tool.category),
@@ -469,12 +469,16 @@ impl Launcher {
             cx.notify();
             return;
         }
+        let (target, args) = match win::split_command(&target) {
+            Some((program, extra)) => (program, crate::launcher::join_args(&extra, &read(&editor.args, cx))),
+            None => (target, read(&editor.args, cx)),
+        };
         let tool = Tool {
             id: editor.id.clone().unwrap_or_else(crate::config::new_id),
             name: name.clone(),
             description: read(&editor.description, cx),
             target,
-            args: read(&editor.args, cx),
+            args,
             workdir: read(&editor.workdir, cx),
             icon: editor.icon.clone(),
             icon_path: editor.icon_path.clone(),

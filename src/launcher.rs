@@ -191,6 +191,15 @@ mod ring_tests {
     }
 }
 
+/// Arguments from a split command line followed by the tool's own.
+pub fn join_args(first: &str, second: &str) -> String {
+    match (first.trim(), second.trim()) {
+        ("", b) => b.to_string(),
+        (a, "") => a.to_string(),
+        (a, b) => format!("{a} {b}"),
+    }
+}
+
 /// How long Alt has to be held on its own before the ring pops up.
 const RING_HOLD: Duration = Duration::from_millis(300);
 
@@ -873,7 +882,9 @@ impl Launcher {
             target.to_string()
         };
         self.cached_icon(target.to_string(), cx, move || {
-            let path = win::resolve_target_path(&resolved)?;
+            // For a command line, the program's own icon.
+            let path = win::resolve_target_path(&resolved)
+                .or_else(|| win::split_command(&resolved).and_then(|(program, _)| win::resolve_target_path(&program)))?;
             let b = win::file_icon(&win::icon_source(&path))?;
             // Shell bitmaps are already BGRA, which is what GPUI expects.
             image::RgbaImage::from_raw(b.width, b.height, b.bgra)
@@ -1980,8 +1991,17 @@ impl Launcher {
         } else {
             tool.target.clone()
         };
+        // A whole command line typed into 目标 runs like a shortcut would.
+        let (program, args) = match win::split_command(&program) {
+            Some((program, extra)) => (program, join_args(&extra, &tool.args)),
+            None => (program, tool.args.clone()),
+        };
+        let workdir = match tool.workdir.trim() {
+            "" => win::default_workdir(&program),
+            dir => dir.to_string(),
+        };
         self.record(&Target::Tool(id.to_string()), &tool.name);
-        self.spawn_launch(program, tool.args.clone(), tool.workdir.clone(), admin, cx);
+        self.spawn_launch(program, args, workdir, admin, cx);
         true
     }
 

@@ -538,6 +538,43 @@ pub fn search_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Resolve a launch target to a filesystem path suitable for icon lookup.
+/// A target typed as a whole command line, like a shortcut's 目标 field
+/// (`G:\tools\app\pythonw.exe -c "run()"`): split into the program and its
+/// arguments. `None` when the target already is a path, URL or shell URI as it is.
+pub fn split_command(target: &str) -> Option<(String, String)> {
+    let t = target.trim();
+    if t.is_empty() || t.contains("://") || resolve_target_path(t).is_some() {
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let args = rest[end + 1..].trim();
+        return (!args.is_empty()).then(|| (rest[..end].to_string(), args.to_string()));
+    }
+    // Unquoted: the shortest start (up to a space) that names an existing program,
+    // so paths with spaces in them still work.
+    t.match_indices(' ').map(|(i, _)| i).find_map(|i| {
+        let program = &t[..i];
+        let exists = resolve_target_path(program).is_some_and(|p| p.is_file())
+            || (Path::new(program).extension().is_none() && resolve_target_path(&format!("{program}.exe")).is_some());
+        exists.then(|| (program.to_string(), t[i + 1..].trim().to_string()))
+    })
+}
+
+/// Where a program starts when its tool has no 工作目录: its own folder, as when it
+/// is opened from Explorer. Documents, shortcuts and URIs are left to the shell.
+pub fn default_workdir(program: &str) -> String {
+    let Some(path) = resolve_target_path(program) else { return String::new() };
+    let runnable = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "exe" | "bat" | "cmd" | "com"));
+    match path.parent() {
+        Some(dir) if runnable => dir.display().to_string(),
+        _ => String::new(),
+    }
+}
+
 pub fn resolve_target_path(target: &str) -> Option<PathBuf> {
     let target = expand_env(target.trim().trim_matches('"'));
     if target.is_empty() || target.contains("://") || target.ends_with(':') {
@@ -882,4 +919,33 @@ pub fn is_autostart() -> bool {
         .open(RUN_KEY)
         .and_then(|k| k.get_string(RUN_VALUE))
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_command_lines() {
+        let notepad = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(split_command(notepad), None, "a plain path stays as it is");
+        assert_eq!(
+            split_command(&format!(r#"{notepad} -c "from x import run;run()""#)),
+            Some((notepad.to_string(), r#"-c "from x import run;run()""#.to_string()))
+        );
+        assert_eq!(
+            split_command(&format!(r#""{notepad}" C:\a b.txt"#)),
+            Some((notepad.to_string(), r"C:\a b.txt".to_string()))
+        );
+        assert_eq!(split_command("notepad readme.txt"), Some(("notepad".into(), "readme.txt".into())));
+        assert_eq!(split_command("ms-settings:display"), None);
+        assert_eq!(split_command("https://example.com/a b"), None);
+        assert_eq!(split_command("no-such-program --flag"), None);
+    }
+
+    #[test]
+    fn programs_start_in_their_folder() {
+        assert_eq!(default_workdir(r"C:\Windows\System32\notepad.exe"), r"C:\Windows\System32");
+        assert_eq!(default_workdir("ms-settings:"), "");
+    }
 }
