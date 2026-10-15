@@ -951,6 +951,10 @@ impl Launcher {
 
     /// Alt has been held on its own long enough: pop up the ring of tools.
     fn show_ring(&mut self, cx: &mut Context<Self>) {
+        // Holding Alt is often part of playing a game: stay out of the way.
+        if self.config.settings.ring_skip_fullscreen && win::fullscreen_app_in_front() {
+            return;
+        }
         let items: Vec<crate::ring::RingItem> = self
             .ring_tools()
             .into_iter()

@@ -267,6 +267,51 @@ pub fn place_corner_popup(raw: isize, size: f32, margin: f32) {
     }
 }
 
+/// Is a full-screen program in front: a game, a full-screen video, a presentation?
+pub fn fullscreen_app_in_front() -> bool {
+    use windows::Win32::UI::{
+        Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState},
+        WindowsAndMessaging::{GWL_STYLE, GetForegroundWindow, GetWindowLongW, WS_CAPTION},
+    };
+    // What Windows itself uses to hold back notifications: exclusive full-screen
+    // Direct3D, presentation mode, and other full-screen apps it knows about.
+    if let Ok(state) = unsafe { SHQueryUserNotificationState() } {
+        if matches!(state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE) {
+            return true;
+        }
+    }
+    // Borderless "full-screen windowed" games and videos: a window without a title
+    // bar covering its whole monitor. (A maximized window keeps its title bar.)
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || matches!(class_name(fg).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+        if GetWindowLongW(fg, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0 {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(fg, &mut rect).is_err() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+    }
+}
+
+fn class_name(h: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(h, &mut buf) };
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
 /// The pointer's position relative to a window's top-left corner, in logical pixels.
 pub fn cursor_in_window(raw: isize) -> Option<(f32, f32)> {
     let h = hwnd(raw);

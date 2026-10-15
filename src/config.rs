@@ -132,6 +132,8 @@ pub struct Settings {
     pub preview_wrap: bool,
     /// Hold Alt to pop up a ring of favourite tools in the bottom-right corner.
     pub alt_ring: bool,
+    /// …except while a full-screen program (a game, a video) is in front.
+    pub ring_skip_fullscreen: bool,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
     pub ffmpeg_path: String,
 }
@@ -242,6 +244,7 @@ impl Default for Settings {
             space_preview: true,
             preview_wrap: true,
             alt_ring: true,
+            ring_skip_fullscreen: true,
             ffmpeg_path: String::new(),
         }
     }

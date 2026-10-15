@@ -1249,6 +1249,22 @@ impl Launcher {
                     cx.notify();
                 })),
             )
+            .when(settings.alt_ring, |d| {
+                d.child(
+                    toggle(
+                        "ring-fullscreen",
+                        "全屏游戏、全屏视频时不弹出",
+                        "前台是全屏程序（包括无边框全屏的游戏）时，按住 Alt 不会弹出圆环，打游戏不会误触",
+                        settings.ring_skip_fullscreen,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.ring_skip_fullscreen = !this.config.settings.ring_skip_fullscreen;
+                        this.config.save();
+                        cx.notify();
+                    })),
+                )
+            })
             .child(
                 toggle(
                     "everything",
