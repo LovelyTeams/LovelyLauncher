@@ -222,10 +222,28 @@ pub fn place_window(raw: isize, width: f32, height: f32, anchor: Option<isize>) 
     }
 }
 
+/// Drop everything the system draws around a window: the 1px border and rounded
+/// corners of Windows 11, and the shadow. Only our own (transparent) pixels remain.
+pub fn remove_window_frame(raw: isize) {
+    use windows::Win32::Graphics::Dwm::{
+        DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    };
+    let h = hwnd(raw);
+    let set = |attr, value: u32| unsafe {
+        let _ = DwmSetWindowAttribute(h, attr, &value as *const u32 as *const c_void, 4);
+    };
+    // DWMWA_COLOR_NONE; Windows 10 ignores the attributes it doesn't know.
+    set(DWMWA_BORDER_COLOR, 0xFFFF_FFFE);
+    set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND.0 as u32);
+    set(DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED.0 as u32);
+}
+
 /// Show a borderless popup without activating it, above everything: `size` logical
 /// pixels square, in the bottom-right corner of the work area under the cursor.
 pub fn place_corner_popup(raw: isize, size: f32, margin: f32) {
     use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
+    remove_window_frame(raw);
     let h = hwnd(raw);
     unsafe {
         let mut cursor = POINT::default();

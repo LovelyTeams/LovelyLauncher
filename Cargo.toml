@@ -34,6 +34,7 @@ features = [
     "Storage_Streams",
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Multimedia",
