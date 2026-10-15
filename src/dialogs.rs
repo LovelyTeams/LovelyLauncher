@@ -1417,7 +1417,7 @@ impl Launcher {
                 div()
                     .text_size(px(12.))
                     .text_color(theme.text_faint)
-                    .child("支持：Markdown、图片、文本与代码、Word（.docx）、Excel（.xlsx）、CSV / TSV、音频、视频、文件夹"),
+                    .child("支持：Markdown、图片、文本与代码、PDF、网页、Word（.docx）、Excel（.xlsx）、CSV / TSV、压缩包、音频、视频、文件夹"),
             )
             .child(
                 div()

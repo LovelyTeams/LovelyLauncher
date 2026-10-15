@@ -35,9 +35,16 @@ use crate::{
 };
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // Helper process that renders PDF pages for the preview (see preview::pdf).
+    if let Some(i) = args.iter().position(|a| a == preview::pdf::WORKER_FLAG) {
+        if let Some(path) = args.get(i + 1) {
+            preview::pdf::run_worker(std::path::Path::new(path));
+        }
+        return;
+    }
     // A freshly installed update waits for the previous version to exit first,
     // otherwise the single-instance check would just hand off to it.
-    let args: Vec<String> = std::env::args().collect();
     let updated = match args.iter().position(|a| a == "--after-update") {
         Some(i) => {
             let pid = args.get(i + 1).and_then(|p| p.parse().ok()).unwrap_or(0);

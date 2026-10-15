@@ -1,13 +1,17 @@
 //! QuickLook-style file preview window.
 
+pub mod archive;
 pub mod ffmpeg;
 pub mod hook;
+pub mod html;
 pub mod media;
 pub mod office;
+pub mod pdf;
 pub mod scrollbar;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, atomic::Ordering},
@@ -22,6 +26,8 @@ use gpui::{
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, WindowControlArea, actions,
     canvas, div, img, list, prelude::*, px, uniform_list,
 };
+use futures::StreamExt as _;
+use pulldown_cmark::Event;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
@@ -69,6 +75,9 @@ pub enum Kind {
     Word,
     Audio,
     Video,
+    Pdf,
+    Html,
+    Archive,
     Folder,
     Other,
 }
@@ -90,6 +99,9 @@ pub fn kind_of(path: &Path) -> Kind {
         "tsv" | "tab" => Kind::Delimited('\t'),
         "xlsx" | "xlsm" => Kind::Excel,
         "docx" => Kind::Word,
+        "pdf" => Kind::Pdf,
+        "html" | "htm" | "xhtml" | "shtml" => Kind::Html,
+        e if archive::EXTENSIONS.contains(&e) => Kind::Archive,
         "mp3" | "wav" | "wma" | "mid" | "midi" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "ape"
         | "aiff" | "aif" | "amr" => Kind::Audio,
         "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" | "flv" | "m4v" | "mts" | "m2ts" | "3gp" | "mpg"
@@ -114,6 +126,8 @@ pub fn initial_size(kind: Kind) -> (f32, f32) {
         Kind::Audio => (560., 300.),
         Kind::Image | Kind::Video => (1000., 720.),
         Kind::Folder | Kind::Other => (620., 520.),
+        Kind::Archive => (760., 600.),
+        Kind::Pdf => (860., 940.),
         _ => (920., 720.),
     }
 }
@@ -219,7 +233,24 @@ enum Loaded {
     Folder(Vec<(String, bool, u64)>, usize),
     Info(String),
     Media,
+    Pdf(pdf::PdfDoc, futures::channel::mpsc::UnboundedReceiver<pdf::Rendered>),
+    /// Reading view and highlighted source.
+    Html(html::Page, TextDoc),
+    Archive(Vec<archive::Row>),
 }
+
+/// Rendered PDF pages kept on the GPU (a few around the current position).
+#[derive(Default)]
+struct PdfCache {
+    images: HashMap<usize, Arc<RenderImage>>,
+    /// Requested and not back yet.
+    pending: HashSet<usize>,
+    /// Least recently shown first.
+    recent: VecDeque<usize>,
+    errors: HashMap<usize, String>,
+}
+
+const PDF_CACHE_PAGES: usize = 10;
 
 enum Content {
     Loading,
@@ -242,6 +273,16 @@ enum Content {
     Info(String),
     Media,
     NeedFfmpeg,
+    Pdf { doc: Arc<pdf::PdfDoc>, list: ListState, cache: Rc<RefCell<PdfCache>> },
+    Html {
+        events: Arc<Vec<Event<'static>>>,
+        images: Arc<Vec<Arc<Image>>>,
+        source: Arc<TextDoc>,
+        show_source: bool,
+        list: ListState,
+        scroll: UniformListScrollHandle,
+    },
+    Archive { rows: Arc<Vec<archive::Row>>, collapsed: HashSet<usize> },
 }
 
 pub struct Preview {
@@ -346,6 +387,11 @@ impl Preview {
         if let Some(frame) = self.frame.take() {
             let _ = window.drop_image(frame);
         }
+        if let Content::Pdf { cache, .. } = &self.content {
+            for (_, image) in cache.borrow_mut().images.drain() {
+                let _ = window.drop_image(image);
+            }
+        }
         self.generation += 1;
         let generation = self.generation;
         self.path = path.clone();
@@ -419,6 +465,39 @@ impl Preview {
                             },
                             Loaded::Folder(entries, total) => Content::Folder { entries: Arc::new(entries), total },
                             Loaded::Info(type_name) => Content::Info(type_name),
+                            Loaded::Pdf(doc, mut pages) => {
+                                let cache = Rc::new(RefCell::new(PdfCache::default()));
+                                cx.spawn_in(window, async move |this, cx| {
+                                    while let Some(page) = pages.next().await {
+                                        let alive = this.update_in(cx, |this, window, cx| {
+                                            this.pdf_page_ready(generation, page, window, cx)
+                                        });
+                                        if alive.is_err() {
+                                            break;
+                                        }
+                                    }
+                                })
+                                .detach();
+                                let list = ListState::new(doc.pages.len(), ListAlignment::Top, px(1200.));
+                                Content::Pdf { doc: Arc::new(doc), list, cache }
+                            }
+                            Loaded::Html(page, source) => Content::Html {
+                                events: Arc::new(page.events),
+                                images: Arc::new(page.images),
+                                list: ListState::new(source.rows.len(), ListAlignment::Top, px(600.)),
+                                source: Arc::new(source),
+                                show_source: false,
+                                scroll: UniformListScrollHandle::new(),
+                            },
+                            Loaded::Archive(rows) => {
+                                // Big archives open with sub-folders folded.
+                                let collapsed = if rows.len() > 300 {
+                                    rows.iter().enumerate().filter(|(_, r)| r.dir && r.depth >= 1).map(|(i, _)| i).collect()
+                                } else {
+                                    HashSet::new()
+                                };
+                                Content::Archive { rows: Arc::new(rows), collapsed }
+                            }
                             Loaded::Media => {
                                 // Sniffing turned an unknown file (".ts") into a video.
                                 this.kind = Kind::Video;
@@ -598,7 +677,7 @@ impl Preview {
     /// Switch between wrapped lines and sideways scrolling, keeping the top row in view.
     fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
         self.wrap = !self.wrap;
-        if let Content::Text { list, scroll, .. } = &self.content {
+        if let Some((list, scroll)) = self.text_view() {
             if self.wrap {
                 let offset = scroll.0.borrow().base_handle.offset();
                 let top = (-f32::from(offset.y) / ROW_HEIGHT).max(0.) as usize;
@@ -614,6 +693,64 @@ impl Preview {
                 launcher.config.save();
             })
             .ok();
+        cx.notify();
+    }
+
+    /// The line-based text view on screen, if any (a text file, or an HTML page's source).
+    fn text_view(&self) -> Option<(&ListState, &UniformListScrollHandle)> {
+        match &self.content {
+            Content::Text { list, scroll, .. } | Content::Html { list, scroll, show_source: true, .. } => Some((list, scroll)),
+            _ => None,
+        }
+    }
+
+    fn toggle_html_source(&mut self, cx: &mut Context<Self>) {
+        if let Content::Html { show_source, .. } = &mut self.content {
+            *show_source = !*show_source;
+            cx.notify();
+        }
+    }
+
+    fn toggle_archive_folder(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Content::Archive { collapsed, .. } = &mut self.content {
+            if !collapsed.remove(&row) {
+                collapsed.insert(row);
+            }
+            cx.notify();
+        }
+    }
+
+    /// A rendered PDF page came back from the worker.
+    fn pdf_page_ready(&mut self, generation: u64, page: pdf::Rendered, window: &mut Window, cx: &mut Context<Self>) {
+        let cache = match &self.content {
+            Content::Pdf { cache, .. } if self.generation == generation => cache.clone(),
+            _ => {
+                if let Ok(image) = page.image {
+                    let _ = window.drop_image(image);
+                }
+                return;
+            }
+        };
+        let mut c = cache.borrow_mut();
+        c.pending.remove(&page.page);
+        match page.image {
+            Ok(image) => {
+                if let Some(old) = c.images.insert(page.page, image) {
+                    let _ = window.drop_image(old);
+                }
+                c.recent.retain(|&p| p != page.page);
+                c.recent.push_back(page.page);
+                while c.recent.len() > PDF_CACHE_PAGES {
+                    let Some(old) = c.recent.pop_front() else { break };
+                    if let Some(image) = c.images.remove(&old) {
+                        let _ = window.drop_image(image);
+                    }
+                }
+            }
+            Err(err) => {
+                c.errors.insert(page.page, err);
+            }
+        }
         cx.notify();
     }
 
@@ -667,6 +804,39 @@ fn load(path: &Path, kind: Kind) -> Result<(Loaded, String), String> {
             Ok((Loaded::Markdown(text), meta))
         }
         Kind::Text => load_text(path),
+        Kind::Pdf => {
+            let (doc, pages) = pdf::open(path)?;
+            let meta = format!("PDF · {} 页", doc.pages.len());
+            Ok((Loaded::Pdf(doc, pages), meta))
+        }
+        Kind::Html => {
+            let (bytes, truncated) = office::read_prefix(path, TEXT_LIMIT)?;
+            let (text, encoding) = office::decode_text(&bytes);
+            let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
+            let page = html::convert(&text);
+            let source = text_doc(&text, highlight::lang_for_ext("html"));
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(title) = &page.title {
+                parts.push(title.clone());
+            }
+            parts.push(encoding.to_string());
+            if truncated || page.truncated {
+                parts.push("页面较长，只显示前面部分".into());
+            }
+            Ok((Loaded::Html(page, source), parts.join(" · ")))
+        }
+        Kind::Archive => {
+            let listing = archive::list(path)?;
+            let rows = archive::tree(&listing.entries);
+            let files = rows.iter().filter(|r| !r.dir).count();
+            let dirs = rows.len() - files;
+            let unpacked: u64 = rows.iter().filter(|r| r.depth == 0).map(|r| r.size).sum();
+            let mut meta = format!("{files} 个文件 · {dirs} 个文件夹 · 解压后 {}", human_size(unpacked));
+            if listing.truncated {
+                meta.push_str(&format!(" · 只列出前 {} 项", listing.entries.len()));
+            }
+            Ok((Loaded::Archive(rows), meta))
+        }
         Kind::Delimited(delim) => {
             let (bytes, truncated) = office::read_prefix(path, 64 * 1024 * 1024)?;
             let (text, encoding) = office::decode_text(&bytes);
@@ -874,7 +1044,24 @@ impl Preview {
                     .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).truncate().child(name))
                     .child(div().text_size(px(11.5)).text_color(theme.text_faint).truncate().child(self.meta.clone())),
             )
-            .when(matches!(self.content, Content::Text { .. }), |d| {
+            .when_some(
+                match &self.content {
+                    Content::Html { show_source, .. } => Some(*show_source),
+                    _ => None,
+                },
+                |d, source| {
+                    d.child(
+                        button(
+                            "toggle-html",
+                            if source { "globe" } else { "code" },
+                            if source { "查看网页" } else { "查看源码" },
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_html_source(cx))),
+                    )
+                },
+            )
+            .when(self.text_view().is_some(), |d| {
                 let on = self.wrap;
                 d.child(
                     button("toggle-wrap", "wrap", "自动换行", theme)
@@ -951,95 +1138,25 @@ impl Preview {
                     theme,
                 )
             }
-            Content::Text { doc, list: state, scroll, .. } => {
-                let doc = doc.clone();
-                let (faint, text, dark) = (theme.text_faint, theme.text, theme.dark);
-                // Line numbers plus the left margin.
-                let gutter = doc.lines.to_string().len().max(2) as f32 * 8. + 26.;
-                let wrap = self.wrap;
-                let (rows, widest) = (doc.rows.len(), doc.widest);
-                let surface = theme.surface;
-                let sideways = scroll.0.borrow().base_handle.clone();
-                let render_row = move |ix: usize| -> Div {
-                    let row = &doc.rows[ix];
-                    let content: AnyElement = if !row.spans.is_empty() {
-                        StyledText::new(row.text.clone())
-                            .with_highlights(highlight::styled(&row.spans, dark))
-                            .into_any_element()
-                    } else if row.text.is_empty() {
-                        " ".into_any_element()
-                    } else {
-                        row.text.clone().into_any_element()
-                    };
-                    // The row moves left when scrolled sideways; shift the line number
-                    // back so it stays put, painted over the text that slides under it.
-                    let shift = if wrap { px(0.) } else { -sideways.offset().x };
-                    div()
-                        .relative()
-                        .flex()
-                        .pr(px(12.))
-                        .font_family("Consolas")
-                        .text_size(px(13.))
-                        .line_height(px(ROW_HEIGHT))
-                        .child(div().flex_none().w(px(gutter)))
-                        .child(
-                            div()
-                                .text_color(text)
-                                .when(wrap, |d| d.flex_1().min_w_0())
-                                .when(!wrap, |d| d.flex_none().whitespace_nowrap())
-                                .child(content),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .left(shift)
-                                .w(px(gutter))
-                                .pr(px(14.))
-                                .text_right()
-                                .text_color(faint)
-                                .bg(surface)
-                                .child(row.line.map(|n| n.to_string()).unwrap_or_default()),
-                        )
-                };
-                let color = theme.text_faint;
-                if wrap {
-                    div()
-                        .relative()
-                        .size_full()
-                        .child(
-                            list(state.clone(), move |ix, _, _| render_row(ix).w_full().into_any_element())
-                                .size_full()
-                                .py(px(8.)),
-                        )
-                        .child(scrollbar::vertical(
-                            Track::List { state: state.clone(), row: px(ROW_HEIGHT) },
-                            &self.drags,
-                            color,
-                            false,
-                        ))
-                        .into_any_element()
-                } else {
-                    let base = scroll.0.borrow().base_handle.clone();
-                    div()
-                        .relative()
-                        .size_full()
-                        .child(
-                            uniform_list("text-rows", rows, move |range, _, _| range.map(&render_row).collect())
-                                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                                .with_width_from_item(Some(widest))
-                                .track_scroll(scroll.clone())
-                                .size_full()
-                                .pt(px(8.))
-                                .pb(px(8. + scrollbar::THICKNESS)),
-                        )
-                        .child(scrollbar::vertical(Track::Handle(base.clone()), &self.drags, color, true))
-                        .child(scrollbar::horizontal(base, &self.drags, color))
-                        .into_any_element()
-                }
-            }
+            Content::Text { doc, list, scroll, .. } => self.render_text(doc, list, scroll, theme),
             Content::Table { sheets, widths } => self.render_table(sheets.clone(), widths.clone(), theme, cx),
+            Content::Pdf { doc, list, cache } => self.render_pdf(doc, list, cache, theme),
+            Content::Html { source, show_source: true, list, scroll, .. } => self.render_text(source, list, scroll, theme),
+            Content::Html { events, images, .. } => {
+                let blocks = crate::markdown::render_events(events.iter().cloned(), self.path.parent(), images, theme);
+                self.with_vertical_bar(
+                    div()
+                        .id("html")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .px(px(36.))
+                        .py(px(24.))
+                        .child(div().w_full().flex().flex_col().gap(px(8.)).children(blocks)),
+                    theme,
+                )
+            }
+            Content::Archive { rows, collapsed } => self.render_archive(rows, collapsed, theme, cx),
             Content::Doc { blocks, images } => {
                 let elements: Vec<AnyElement> = blocks
                     .iter()
@@ -1125,6 +1242,221 @@ impl Preview {
             Content::Media => self.render_media(theme, cx),
             Content::NeedFfmpeg => self.render_need_ffmpeg(theme, cx),
         }
+    }
+
+    /// Text with line numbers: wrapped rows in a list, or fixed rows that scroll sideways.
+    fn render_text(&self, doc: &Arc<TextDoc>, state: &ListState, scroll: &UniformListScrollHandle, theme: &Theme) -> AnyElement {
+        let doc = doc.clone();
+        let (faint, text, dark) = (theme.text_faint, theme.text, theme.dark);
+        // Line numbers plus the left margin.
+        let gutter = doc.lines.to_string().len().max(2) as f32 * 8. + 26.;
+        let wrap = self.wrap;
+        let (rows, widest) = (doc.rows.len(), doc.widest);
+        let surface = theme.surface;
+        let sideways = scroll.0.borrow().base_handle.clone();
+        let render_row = move |ix: usize| -> Div {
+            let row = &doc.rows[ix];
+            let content: AnyElement = if !row.spans.is_empty() {
+                StyledText::new(row.text.clone())
+                    .with_highlights(highlight::styled(&row.spans, dark))
+                    .into_any_element()
+            } else if row.text.is_empty() {
+                " ".into_any_element()
+            } else {
+                row.text.clone().into_any_element()
+            };
+            // The row moves left when scrolled sideways; shift the line number
+            // back so it stays put, painted over the text that slides under it.
+            let shift = if wrap { px(0.) } else { -sideways.offset().x };
+            div()
+                .relative()
+                .flex()
+                .pr(px(12.))
+                .font_family("Consolas")
+                .text_size(px(13.))
+                .line_height(px(ROW_HEIGHT))
+                .child(div().flex_none().w(px(gutter)))
+                .child(
+                    div()
+                        .text_color(text)
+                        .when(wrap, |d| d.flex_1().min_w_0())
+                        .when(!wrap, |d| d.flex_none().whitespace_nowrap())
+                        .child(content),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(shift)
+                        .w(px(gutter))
+                        .pr(px(14.))
+                        .text_right()
+                        .text_color(faint)
+                        .bg(surface)
+                        .child(row.line.map(|n| n.to_string()).unwrap_or_default()),
+                )
+        };
+        let color = theme.text_faint;
+        if wrap {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    list(state.clone(), move |ix, _, _| render_row(ix).w_full().into_any_element())
+                        .size_full()
+                        .py(px(8.)),
+                )
+                .child(scrollbar::vertical(
+                    Track::List { state: state.clone(), row: px(ROW_HEIGHT) },
+                    &self.drags,
+                    color,
+                    false,
+                ))
+                .into_any_element()
+        } else {
+            let base = scroll.0.borrow().base_handle.clone();
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    uniform_list("text-rows", rows, move |range, _, _| range.map(&render_row).collect())
+                        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                        .with_width_from_item(Some(widest))
+                        .track_scroll(scroll.clone())
+                        .size_full()
+                        .pt(px(8.))
+                        .pb(px(8. + scrollbar::THICKNESS)),
+                )
+                .child(scrollbar::vertical(Track::Handle(base.clone()), &self.drags, color, true))
+                .child(scrollbar::horizontal(base, &self.drags, color))
+                .into_any_element()
+        }
+    }
+
+    /// PDF pages one below another, rendered as they come into view.
+    fn render_pdf(&self, doc: &Arc<pdf::PdfDoc>, state: &ListState, cache: &Rc<RefCell<PdfCache>>, theme: &Theme) -> AnyElement {
+        let (doc, cache) = (doc.clone(), cache.clone());
+        let (faint, border) = (theme.text_faint, theme.border);
+        // The list's width from the last frame (the list can't be asked while it lays out).
+        let list_width = f32::from(state.viewport_bounds().size.width);
+        let pages = list(state.clone(), move |ix, window, _| {
+            let (w, h) = doc.pages[ix];
+            // Render at the width the page is shown at, in device pixels.
+            let list_width = if list_width > 0. { list_width } else { f32::from(window.viewport_size().width) };
+            let shown = (list_width - 40.).max(200.);
+            let width = ((shown * window.scale_factor() / 100.).ceil() * 100.) as u32;
+            let mut c = cache.borrow_mut();
+            let image = c.images.get(&ix).cloned();
+            if image.is_some() {
+                // Keep pages on screen from being evicted.
+                c.recent.retain(|&p| p != ix);
+                c.recent.push_back(ix);
+            } else if !c.pending.contains(&ix) && !c.errors.contains_key(&ix) {
+                c.pending.insert(ix);
+                doc.request(ix, width);
+            }
+            let error = c.errors.get(&ix).cloned();
+            drop(c);
+            let mut page = div().w_full().bg(gpui::white()).border_1().border_color(border).overflow_hidden();
+            page.style().aspect_ratio = Some(w / h);
+            let page = match image {
+                Some(image) => page.child(img(image).size_full()),
+                None => page
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.))
+                    .text_color(faint)
+                    .child(error.unwrap_or_else(|| format!("第 {} 页", ix + 1))),
+            };
+            div().w_full().px(px(20.)).py(px(8.)).child(page).into_any_element()
+        })
+        .size_full()
+        .py(px(8.));
+        div()
+            .relative()
+            .size_full()
+            .bg(theme.kbd_bg)
+            .child(pages)
+            .child(scrollbar::vertical(Track::List { state: state.clone(), row: px(1000.) }, &self.drags, theme.text_faint, false))
+            .into_any_element()
+    }
+
+    /// Archive contents as a folder tree; click a folder to fold it.
+    fn render_archive(&self, rows: &Arc<Vec<archive::Row>>, collapsed: &HashSet<usize>, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if rows.is_empty() {
+            return centered(div().text_color(theme.text_faint).child("压缩包是空的"));
+        }
+        let mut visible = Vec::with_capacity(rows.len());
+        let mut i = 0;
+        while i < rows.len() {
+            visible.push(i);
+            i += if collapsed.contains(&i) { rows[i].descendants + 1 } else { 1 };
+        }
+        let (rows, collapsed) = (rows.clone(), Arc::new(collapsed.clone()));
+        let (text, faint, folder, hover) = (theme.text, theme.text_faint, theme.folder, theme.row_hover);
+        let weak = cx.entity().downgrade();
+        let count = visible.len();
+        let list = uniform_list("archive-rows", count, move |range, _, _| {
+            range
+                .map(|v| {
+                    let ix = visible[v];
+                    let row = &rows[ix];
+                    let open = !collapsed.contains(&ix);
+                    let weak = weak.clone();
+                    div()
+                        .id(("archive-row", ix))
+                        .w_full()
+                        .h(px(30.))
+                        .pr(px(16.))
+                        .pl(px(12. + row.depth as f32 * 18.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(13.))
+                        .text_color(text)
+                        .when(row.dir, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(hover)).on_click(move |_, _, cx| {
+                                weak.update(cx, |this, cx| this.toggle_archive_folder(ix, cx)).ok();
+                            })
+                        })
+                        .child(match row.dir {
+                            true => icon(if open { "chevron-down" } else { "chevron-right" }, 14., faint).into_any_element(),
+                            false => div().w(px(14.)).flex_none().into_any_element(),
+                        })
+                        .child(icon(if row.dir { "folder" } else { "file" }, 16., if row.dir { folder } else { faint }))
+                        .child(div().flex_1().min_w_0().truncate().child(row.name.clone()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(faint)
+                                .child(if row.dir && row.size == 0 { String::new() } else { human_size(row.size) }),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(104.))
+                                .text_right()
+                                .text_size(px(12.))
+                                .text_color(faint)
+                                .truncate()
+                                .child(row.modified.clone()),
+                        )
+                })
+                .collect()
+        })
+        .track_scroll(self.rows_scroll.clone())
+        .size_full()
+        .py(px(6.));
+        let handle = self.rows_scroll.0.borrow().base_handle.clone();
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .child(scrollbar::vertical(Track::Handle(handle), &self.drags, theme.text_faint, false))
+            .into_any_element()
     }
 
     /// `body` (which scrolls with `self.scroll`) plus a vertical scrollbar.

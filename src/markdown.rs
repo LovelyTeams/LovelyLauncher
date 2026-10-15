@@ -4,12 +4,15 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use gpui::{
-    AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, IntoElement, ObjectFit,
-    StrikethroughStyle, StyledImage, StyledText, UnderlineStyle, div, img, prelude::*, px,
+    AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, Image, ImageSource, IntoElement,
+    ObjectFit, StrikethroughStyle, StyledImage, StyledText, UnderlineStyle, div, img, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -20,9 +23,21 @@ static COPY_IDS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn render(source: &str, base_dir: Option<&Path>, theme: &Theme) -> Vec<AnyElement> {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    render_events(Parser::new_ext(source, options), base_dir, &[], theme)
+}
+
+/// Draw events that were produced elsewhere (the HTML preview builds its own).
+/// An image whose destination is `inline-image:N` is `images[N]`.
+pub fn render_events<'e>(
+    events: impl IntoIterator<Item = Event<'e>>,
+    base_dir: Option<&Path>,
+    images: &[Arc<Image>],
+    theme: &Theme,
+) -> Vec<AnyElement> {
     let mut r = Renderer {
         theme,
         base_dir,
+        inline_images: images,
         stack: vec![Frame::new(Container::Root)],
         inline: None,
         styles: Vec::new(),
@@ -33,7 +48,7 @@ pub fn render(source: &str, base_dir: Option<&Path>, theme: &Theme) -> Vec<AnyEl
         pending_images: Vec::new(),
         table: None,
     };
-    for event in Parser::new_ext(source, options) {
+    for event in events {
         r.event(event);
     }
     // Unterminated constructs while an answer is still streaming.
@@ -81,6 +96,7 @@ struct TableState {
 struct Renderer<'a> {
     theme: &'a Theme,
     base_dir: Option<&'a Path>,
+    inline_images: &'a [Arc<Image>],
     stack: Vec<Frame>,
     inline: Option<Inline>,
     styles: Vec<HighlightStyle>,
@@ -273,12 +289,16 @@ impl Renderer<'_> {
             }
             TagEnd::Image => {
                 if let Some((dest, alt)) = self.image.take() {
-                    match self.local_image(&dest) {
-                        Some(path) => self.pending_images.push(
+                    let source: Option<ImageSource> = match dest.strip_prefix("inline-image:") {
+                        Some(n) => n.parse::<usize>().ok().and_then(|n| self.inline_images.get(n)).cloned().map(Into::into),
+                        None => self.local_image(&dest).map(Into::into),
+                    };
+                    match source {
+                        Some(source) => self.pending_images.push(
                             div()
                                 .my(px(6.))
                                 .max_w_full()
-                                .child(img(path).max_w_full().max_h(px(420.)).object_fit(ObjectFit::Contain))
+                                .child(img(source).max_w_full().max_h(px(420.)).object_fit(ObjectFit::Contain))
                                 .into_any_element(),
                         ),
                         None => {

@@ -51,7 +51,7 @@ pub fn decode_text(bytes: &[u8]) -> (String, &'static str) {
     }
 }
 
-fn ansi_to_string(bytes: &[u8]) -> String {
+pub(crate) fn ansi_to_string(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::{MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar};
     unsafe {
         let len = MultiByteToWideChar(0, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None);

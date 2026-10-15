@@ -55,7 +55,7 @@
 
 **👀 空格快速预览**
 - 在资源管理器或桌面选中文件按**空格**即可预览，方向键切换、再按空格关闭
-- Markdown、图片、文本（自动识别 GBK）、Word、Excel、CSV / TSV、音频、视频
+- Markdown、图片、文本（自动识别 GBK）、PDF、网页、Word、Excel、CSV / TSV、压缩包、音频、视频
 - 代码**语法高亮**，压缩过的 JSON / XML **自动美化**，一键切回原文
 
 **🪟 用着顺手**
@@ -172,6 +172,9 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | 音频 | mp3 / wav / wma / mid | Windows 自带，**无需额外安装** |
 | 音频（更多） | flac / ogg / opus / m4a / aac…… | 需要 FFmpeg |
 | 视频 | mp4 / mkv / mov / avi / webm…… | 需要 FFmpeg |
+| PDF | `.pdf` | 用 Windows 自带的 PDF 引擎逐页渲染，滚到哪页渲染哪页 |
+| 网页 | `.html` `.htm` | 阅读视图：标题、段落、列表、表格、代码、图片（含 base64 内嵌图片）；可切换到高亮源码 |
+| 压缩包 | zip / 7z / rar / tar.gz / tar.xz / iso / cab / jar / apk…… | 按文件夹树列出内容、大小和时间，点文件夹可折叠；中文文件名（含 GBK 编码的 zip）正常显示 |
 | 文件夹 | — | 列出内容与大小 |
 
 **代码高亮与美化**
@@ -264,7 +267,7 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | `src/launcher.rs` | 核心状态与逻辑：搜索、启动、下载、分类、迷你模式、AI 会话 |
 | `src/view.rs` | 主界面渲染：仪表盘、图标格子、搜索结果、迷你框、AI 面板 |
 | `src/dialogs.rs` | 编辑工具、设置（通用 / 外观 / 预览 / AI / 搜索）、分类对话框 |
-| `src/preview/` | 空格预览：键盘钩子与选中文件读取（`hook.rs`）、预览窗口（`mod.rs`）、Office / CSV / 编码（`office.rs`）、播放器（`media.rs`）、FFmpeg（`ffmpeg.rs`） |
+| `src/preview/` | 空格预览：键盘钩子与选中文件读取（`hook.rs`）、预览窗口（`mod.rs`）、Office / CSV / 编码（`office.rs`）、PDF（`pdf.rs`）、网页（`html.rs`）、压缩包（`archive.rs`）、滚动条（`scrollbar.rs`）、播放器（`media.rs`）、FFmpeg（`ffmpeg.rs`） |
 | `src/markdown.rs` | Markdown 渲染（预览与 AI 回答共用） |
 | `src/highlight.rs` | 语法高亮与 JSON / XML 美化 |
 | `src/update.rs` | 从 GitHub Releases 自动更新 |

@@ -27,6 +27,11 @@ quick-xml = "0.42"
 [dependencies.windows]
 version = "0.61"
 features = [
+    "Data_Pdf",
+    "Foundation",
+    "Graphics_Imaging",
+    "Storage",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
