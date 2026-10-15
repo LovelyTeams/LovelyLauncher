@@ -12,9 +12,12 @@ use std::{
     time::Instant,
 };
 
+use std::sync::Arc;
+
 use gpui::{
-    AnyElement, BoxShadow, Context, FontWeight, IntoElement, MouseButton, MouseDownEvent, Render,
-    SharedString, WeakEntity, Window, div, hsla, point, prelude::*, px,
+    AnyElement, BoxShadow, Context, FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, Render,
+    RenderImage, Rgba, SharedString, WeakEntity, Window, div, hsla, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -104,7 +107,17 @@ pub struct Ring {
     /// The pointed-at icon leans towards the pointer by this much (logical px).
     pull_x: Spring,
     pull_y: Spring,
+    /// The centre's picture pops when the selection changes.
+    centre_pop: Spring,
     selected: Option<usize>,
+    /// The app's mascot, shown in the centre while nothing is pointed at.
+    logo: Option<Arc<RenderImage>>,
+}
+
+/// `a` blended towards `b` by `t`, as an opaque colour.
+fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let (a, b) = (Rgba::from(a), Rgba::from(b));
+    Hsla::from(Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1. })
 }
 
 /// Quick, slightly bouncy.
@@ -136,13 +149,16 @@ impl Ring {
             bubble: Spring::new(0., 380., 20.),
             pull_x: Spring::new(0., 300., 18.),
             pull_y: Spring::new(0., 300., 18.),
+            centre_pop: Spring::new(1., 500., 16.),
             selected: None,
+            logo: None,
         }
     }
 
     /// Pop the ring up in the corner of the monitor under the cursor.
-    pub fn open(&mut self, items: Vec<RingItem>, cx: &mut Context<Self>) {
+    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, cx: &mut Context<Self>) {
         let now = Instant::now();
+        self.logo = Some(logo);
         self.icons = items.iter().map(|_| Spring::new(0., 420., 15.)).collect();
         self.items = items;
         self.selected = None;
@@ -224,6 +240,9 @@ impl Ring {
         }
         self.bubble.target = if selected.is_some() { 1. } else { 0. };
         self.selected = selected;
+        // The centre's new picture pops in.
+        self.centre_pop.x = 0.6;
+        self.centre_pop.v = 0.;
     }
 
     /// Lean the pointed-at icon towards the pointer at (`x`, `y`).
@@ -266,6 +285,7 @@ impl Ring {
             &mut self.bubble,
             &mut self.pull_x,
             &mut self.pull_y,
+            &mut self.centre_pop,
         ] {
             spring.step(dt);
         }
@@ -386,43 +406,63 @@ impl Render for Ring {
             layers.push(disc(hx + px_ - r_head * 0.42, hy + py_ - r_head * 0.48, r_head * 0.22, r_head * 0.13).bg(white(0.7)).into_any_element());
         }
 
-        // Centre disc with the name of what's pointed at.
-        let label: (SharedString, SharedString) = match self.selected.and_then(|i| self.items.get(i)) {
-            Some(item) => (item.name.clone(), "松开 Alt 打开".into()),
-            None if self.items.is_empty() => ("还没有工具".into(), "在主界面添加工具后就会出现在这里".into()),
-            None => ("LovelyLauncher".into(), "指向图标，松开 Alt 打开".into()),
-        };
-        let mut centre = disc(c, c, INNER * sx, INNER * sy)
-            .bg(theme.surface.opacity(0.86))
-            .border(px(1.5))
-            .border_color(white(0.7))
-            .shadow(vec![BoxShadow {
-                color: hsla(0., 0., 0., 0.18),
-                offset: point(px(0.), px(4. * s)),
-                blur_radius: px(16. * s),
-                spread_radius: px(0.),
-            }])
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(4. * s))
-            .px(px(14. * s));
-        if s > 0.6 {
-            centre = centre
-                .child(
-                    div()
-                        .max_w_full()
-                        .text_center()
-                        .text_size(px(15. * s))
-                        .line_height(px(19. * s))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(label.0),
-                )
-                .child(div().text_center().text_size(px(11. * s)).text_color(theme.text_faint).child(label.1));
+        // Centre: an opaque glossy bubble (translucent layers would turn grey here)
+        // showing the pointed-at app, or the mascot when nothing is pointed at.
+        let base = Hsla { a: 1., ..theme.surface };
+        let (top, bottom, rim) = (base, mix(base, accent, 0.16), mix(base, accent, 0.45));
+        let (rx, ry) = (INNER * sx, INNER * sy);
+        layers.push(
+            disc(c, c, rx, ry)
+                .bg(linear_gradient(180., linear_color_stop(top, 0.25), linear_color_stop(bottom, 1.)))
+                .border(px(2. * s))
+                .border_color(rim)
+                .into_any_element(),
+        );
+        // Gloss across the top of the bubble.
+        layers.push(disc(c, c - ry * 0.62, rx * 0.46, ry * 0.12).bg(mix(top, hsla(0., 0., 1., 1.), 0.85)).into_any_element());
+        if s > 0.55 {
+            let pop = self.centre_pop.x.max(0.);
+            let hint = hsla(accent.h, accent.s * 0.7, if theme.dark { 0.72 } else { 0.42 }, 1.);
+            let selected = self.selected.and_then(|i| self.items.get(i)).map(|item| (item.visual.clone(), item.name.clone()));
+            let (picture, title, note): (Option<AnyElement>, SharedString, SharedString) = match selected {
+                Some((visual, name)) => (self.tile(&visual, 46. * s * pop, &theme, cx), name, "松开 Alt 打开".into()),
+                None => {
+                    let logo = self.logo.clone().map(|logo| img(logo).size(px(58. * s * pop)).rounded_full().into_any_element());
+                    if self.items.is_empty() {
+                        (logo, "还没有工具".into(), "先在主界面添加工具".into())
+                    } else {
+                        (logo, SharedString::default(), "指向图标 · 松开 Alt".into())
+                    }
+                }
+            };
+            let content = div()
+                .absolute()
+                .left(px(c - rx))
+                .top(px(c - ry))
+                .w(px(rx * 2.))
+                .h(px(ry * 2.))
+                .px(px(16. * s))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(5. * s))
+                .children(picture)
+                .when(!title.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .max_w_full()
+                            .text_center()
+                            .truncate()
+                            .text_size(px(14. * s))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                })
+                .child(div().text_center().text_size(px(10.5 * s)).text_color(hint).child(note));
+            layers.push(content.into_any_element());
         }
-        layers.push(centre.into_any_element());
 
         // Icons around the band.
         for i in 0..self.items.len() {
