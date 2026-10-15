@@ -12,7 +12,7 @@
   <img alt="GPUI" src="https://img.shields.io/badge/UI-GPUI-ee6585?style=flat-square" />
 </p>
 
-[功能亮点](#-功能亮点) · [截图](#-截图) · [快速开始](#-快速开始) · [使用指南](#-使用指南) · [AI 助手](#-ai-助手) · [配置](#%EF%B8%8F-配置文件) · [性能](#-性能)
+[功能亮点](#-功能亮点) · [截图](#-截图) · [快速开始](#-快速开始) · [使用指南](#-使用指南) · [AI 助手](#-ai-助手) · [配置](#%EF%B8%8F-配置文件) · [性能](#-性能) · [更新日志](CHANGELOG.md)
 
 <br />
 
@@ -277,6 +277,10 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | `build.rs` | 从 `assets/icon.png` 生成 exe 图标、托盘图标和应用内 Logo |
 
 想换应用图标的话，替换 `assets/icon.png` 再重新编译即可。
+
+## 📄 许可证
+
+[AGPL-3.0](LICENSE)。各版本的变化见 [更新日志](CHANGELOG.md)。
 
 ## 🙏 致谢
 
