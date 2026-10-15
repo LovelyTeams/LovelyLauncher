@@ -789,6 +789,17 @@ impl Launcher {
                             name: dragged.name.clone(),
                         })
                     })
+                    // Drop another tile here to move it into this spot.
+                    .drag_over::<DraggedTool>(|s, _, _, cx| {
+                        let t = Theme::get(cx);
+                        s.bg(t.accent_soft).border_color(t.accent)
+                    })
+                    .on_drop({
+                        let target = tool.id.clone();
+                        cx.listener(move |this, dragged: &DraggedTool, _, cx| {
+                            this.move_tool(&dragged.id, Some(&target), cx)
+                        })
+                    })
                     .child(tile)
                     .child(
                         div().w_full().flex().justify_center().child(
@@ -846,6 +857,12 @@ impl Launcher {
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.accent_soft).text_color(theme.accent).border_color(theme.accent))
+                // Dropping a tile on the add card moves it to the end.
+                .drag_over::<DraggedTool>(|s, _, _, cx| {
+                    let t = Theme::get(cx);
+                    s.bg(t.accent_soft).border_color(t.accent).text_color(t.accent)
+                })
+                .on_drop(cx.listener(|this, dragged: &DraggedTool, _, cx| this.move_tool(&dragged.id, None, cx)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     let prefill = crate::config::Tool {
                         color: "pink".into(),
@@ -866,7 +883,7 @@ impl Launcher {
                     .text_size(px(12.))
                     .text_color(theme.text_faint)
                     .mr(px(8.))
-                    .child("拖动图标到分类标签即可归类"),
+                    .child("拖动图标可调整顺序，拖到分类标签即可归类"),
             );
 
         div()

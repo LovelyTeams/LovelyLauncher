@@ -206,7 +206,7 @@ pub enum ToolFilter {
     Category(String),
 }
 
-/// Payload while a tool tile is being dragged onto a category tab.
+/// Payload while a tool tile is being dragged (onto another tile, or a category tab).
 #[derive(Clone, Debug)]
 pub struct DraggedTool {
     pub id: String,
@@ -230,7 +230,7 @@ impl gpui::Render for DragPreview {
             .text_color(theme.accent_text)
             .text_size(px(13.))
             .opacity(0.92)
-            .child(format!("移动“{}”到…", self.name))
+            .child(format!("移动“{}”", self.name))
     }
 }
 
@@ -1950,6 +1950,27 @@ impl Launcher {
         self.config.save();
         let target = if category.is_empty() { "未分类" } else { category };
         self.show_toast(format!("已将“{name}”移到「{target}」"), false, cx);
+    }
+
+    /// Drag-and-drop reordering: `id` takes the place of `target` (the tools in between
+    /// shift over by one), or goes to the end when `target` is `None`.
+    pub fn move_tool(&mut self, id: &str, target: Option<&str>, cx: &mut Context<Self>) {
+        let tools = &mut self.config.tools;
+        let Some(from) = tools.iter().position(|t| t.id == id) else { return };
+        let to = match target {
+            Some(target) => match tools.iter().position(|t| t.id == target) {
+                Some(to) => to,
+                None => return,
+            },
+            None => tools.len() - 1,
+        };
+        if from == to {
+            return;
+        }
+        let tool = tools.remove(from);
+        tools.insert(to, tool);
+        self.config.save();
+        cx.notify();
     }
 
     pub fn delete_category(&mut self, name: &str, cx: &mut Context<Self>) {
