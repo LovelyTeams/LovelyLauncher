@@ -4,6 +4,7 @@ pub mod ffmpeg;
 pub mod hook;
 pub mod media;
 pub mod office;
+pub mod scrollbar;
 
 use std::{
     cell::Cell,
@@ -14,11 +15,12 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, Context, FocusHandle, FontWeight,
-    HighlightStyle, Image, ImageFormat, KeyBinding, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, ObjectFit, Pixels, Render, RenderImage, ScrollHandle, SharedString,
-    StrikethroughStyle, StyledImage, StyledText, UnderlineStyle, WeakEntity, Window,
-    WindowControlArea, actions, canvas, div, img, list, prelude::*, px, uniform_list,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight,
+    HighlightStyle, Image, ImageFormat, KeyBinding, ListAlignment, ListHorizontalSizingBehavior,
+    ListOffset, ListState, MouseButton, MouseDownEvent, ObjectFit, Pixels, Render, RenderImage,
+    ScrollHandle, ScrollStrategy, SharedString, StrikethroughStyle, StyledImage, StyledText,
+    UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, WindowControlArea, actions,
+    canvas, div, img, list, prelude::*, px, uniform_list,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -29,6 +31,7 @@ use crate::{
         ffmpeg::FfmpegState,
         media::Player,
         office::{DocBlock, RunStyle, Sheet},
+        scrollbar::{Drags, Track},
     },
     theme::Theme,
     view::icon,
@@ -126,23 +129,84 @@ pub fn human_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
 }
 
-/// Lines of a text file plus per-line syntax spans.
+/// One display row of a text file: a whole line, or a piece of a very long one.
+struct Row {
+    text: SharedString,
+    /// Line number (1-based), on the first piece of each line only.
+    line: Option<usize>,
+    spans: highlight::Spans,
+}
+
+/// A text file split into display rows, with syntax spans.
 pub struct TextDoc {
-    lines: Vec<SharedString>,
-    highlights: Option<Vec<highlight::Spans>>,
+    rows: Vec<Row>,
+    lines: usize,
+    /// Row with the most columns; sizes horizontal scrolling when wrapping is off.
+    widest: usize,
 }
 
 /// Highlighting very large files isn't worth the memory.
 const HIGHLIGHT_LIMIT: usize = 2 * 1024 * 1024;
+/// Longer lines are cut into rows of about this many bytes, so a minified file
+/// doesn't become one enormous row.
+const ROW_BYTES: usize = 2000;
+const ROW_HEIGHT: f32 = 20.;
 
 fn text_doc(text: &str, lang: Option<&'static highlight::Lang>) -> TextDoc {
-    let highlights = lang
+    let mut highlights = lang
         .filter(|_| text.len() <= HIGHLIGHT_LIMIT)
-        .map(|l| highlight::by_line(text, &highlight::highlight(text, l)));
-    TextDoc {
-        lines: text.split('\n').map(|l| SharedString::from(l.to_string())).collect(),
-        highlights,
+        .map(|l| highlight::by_line(text, &highlight::highlight(text, l)).into_iter());
+    let mut rows = Vec::new();
+    let (mut widest, mut widest_cols, mut lines) = (0, 0, 0);
+    for (i, line) in text.split('\n').enumerate() {
+        lines += 1;
+        let mut spans = highlights.as_mut().and_then(|h| h.next()).unwrap_or_default();
+        let mut start = 0;
+        loop {
+            let mut end = (start + ROW_BYTES).min(line.len());
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            let piece = &line[start..end];
+            let cols = columns(piece);
+            if cols > widest_cols {
+                (widest, widest_cols) = (rows.len(), cols);
+            }
+            let whole = start == 0 && end == line.len();
+            rows.push(Row {
+                text: piece.to_string().into(),
+                line: (start == 0).then_some(i + 1),
+                spans: if whole { std::mem::take(&mut spans) } else { clip_spans(&spans, start..end) },
+            });
+            if end >= line.len() {
+                break;
+            }
+            start = end;
+        }
     }
+    TextDoc { rows, lines, widest }
+}
+
+/// Spans inside `range`, shifted to start at 0.
+fn clip_spans(spans: &highlight::Spans, range: std::ops::Range<usize>) -> highlight::Spans {
+    spans
+        .iter()
+        .filter_map(|(r, token)| {
+            let (start, end) = (r.start.max(range.start), r.end.min(range.end));
+            (start < end).then(|| (start - range.start..end - range.start, *token))
+        })
+        .collect()
+}
+
+/// Display width in monospace columns (CJK and emoji take two).
+fn columns(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
 }
 
 enum Loaded {
@@ -165,7 +229,10 @@ enum Content {
         /// The other view (raw ⇄ formatted), when the file was pretty-printed.
         alt: Option<Arc<TextDoc>>,
         formatted: bool,
+        /// Variable-height rows, used while wrapping.
         list: ListState,
+        /// Fixed-height rows that scroll sideways, used with wrapping off.
+        scroll: UniformListScrollHandle,
     },
     Markdown(Arc<String>),
     Image,
@@ -185,6 +252,11 @@ pub struct Preview {
     icon: Option<Arc<RenderImage>>,
     focus: FocusHandle,
     scroll: ScrollHandle,
+    /// Vertical scrolling of table rows.
+    rows_scroll: UniformListScrollHandle,
+    drags: Drags,
+    /// Wrap long lines in text files (otherwise scroll sideways).
+    wrap: bool,
     sheet: usize,
     launcher: WeakEntity<Launcher>,
     player: Option<Player>,
@@ -196,7 +268,14 @@ pub struct Preview {
 }
 
 impl Preview {
-    pub fn new(path: PathBuf, anchor: Option<isize>, launcher: WeakEntity<Launcher>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        anchor: Option<isize>,
+        wrap: bool,
+        launcher: WeakEntity<Launcher>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let hwnd = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
             _ => None,
@@ -214,6 +293,9 @@ impl Preview {
             icon: None,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            rows_scroll: UniformListScrollHandle::new(),
+            drags: Drags::default(),
+            wrap,
             sheet: 0,
             launcher,
             player: None,
@@ -272,6 +354,7 @@ impl Preview {
         self.sheet = 0;
         self.icon = None;
         self.scroll.set_offset(Default::default());
+        self.rows_scroll = UniformListScrollHandle::new();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         window.set_window_title(&format!("{name} - LovelyLauncher 预览"));
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -314,13 +397,14 @@ impl Preview {
                         }
                         this.content = match loaded {
                             Loaded::Text(doc, alt) => {
-                                let list = ListState::new(doc.lines.len(), ListAlignment::Top, px(600.));
+                                let list = ListState::new(doc.rows.len(), ListAlignment::Top, px(600.));
                                 let formatted = alt.is_some();
                                 Content::Text {
                                     doc: Arc::new(doc),
                                     alt: alt.map(Arc::new),
                                     formatted,
                                     list,
+                                    scroll: UniformListScrollHandle::new(),
                                 }
                             }
                             Loaded::Markdown(source) => Content::Markdown(Arc::new(source)),
@@ -490,12 +574,13 @@ impl Preview {
 
     /// Swap between the pretty-printed and the original text.
     fn toggle_formatted(&mut self, cx: &mut Context<Self>) {
-        if let Content::Text { doc, alt: Some(alt), formatted, list } = &mut self.content {
+        if let Content::Text { doc, alt: Some(alt), formatted, list, scroll } = &mut self.content {
             std::mem::swap(doc, alt);
             *formatted = !*formatted;
-            list.reset(doc.lines.len());
+            list.reset(doc.rows.len());
+            *scroll = UniformListScrollHandle::new();
             let flag = if *formatted { "已格式化" } else { "原文" };
-            let lines = format!("{} 行", doc.lines.len());
+            let lines = format!("{} 行", doc.lines);
             // Keep the size first, then insert the view flag after the language name.
             let mut parts: Vec<&str> = self
                 .meta
@@ -508,6 +593,28 @@ impl Preview {
             self.meta = parts.join(" · ").into();
             cx.notify();
         }
+    }
+
+    /// Switch between wrapped lines and sideways scrolling, keeping the top row in view.
+    fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        self.wrap = !self.wrap;
+        if let Content::Text { list, scroll, .. } = &self.content {
+            if self.wrap {
+                let offset = scroll.0.borrow().base_handle.offset();
+                let top = (-f32::from(offset.y) / ROW_HEIGHT).max(0.) as usize;
+                list.scroll_to(ListOffset { item_ix: top, offset_in_item: px(0.) });
+            } else {
+                scroll.scroll_to_item_strict(list.logical_scroll_top().item_ix, ScrollStrategy::Top);
+            }
+        }
+        let wrap = self.wrap;
+        self.launcher
+            .update(cx, |launcher, _| {
+                launcher.config.settings.preview_wrap = wrap;
+                launcher.config.save();
+            })
+            .ok();
+        cx.notify();
     }
 
     fn open_default(&mut self, cx: &mut Context<Self>) {
@@ -642,7 +749,7 @@ fn load_text(path: &Path) -> Result<(Loaded, String), String> {
         parts.push("已格式化".into());
     }
     parts.push(encoding.to_string());
-    parts.push(format!("{} 行", doc.lines.len()));
+    parts.push(format!("{} 行", doc.lines));
     if truncated {
         parts.push("仅显示前 4 MB".into());
     }
@@ -767,6 +874,14 @@ impl Preview {
                     .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).truncate().child(name))
                     .child(div().text_size(px(11.5)).text_color(theme.text_faint).truncate().child(self.meta.clone())),
             )
+            .when(matches!(self.content, Content::Text { .. }), |d| {
+                let on = self.wrap;
+                d.child(
+                    button("toggle-wrap", "wrap", "自动换行", theme)
+                        .when(on, |b| b.bg(theme.accent_soft).text_color(theme.accent))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_wrap(cx))),
+                )
+            })
             .when_some(
                 match &self.content {
                     Content::Text { alt: Some(_), formatted, .. } => Some(*formatted),
@@ -824,49 +939,105 @@ impl Preview {
                 .into_any_element(),
             Content::Markdown(source) => {
                 let blocks = crate::markdown::render(source, self.path.parent(), theme);
-                div()
-                    .id("markdown")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .px(px(36.))
-                    .py(px(24.))
-                    .child(div().w_full().flex().flex_col().gap(px(8.)).children(blocks))
-                    .into_any_element()
+                self.with_vertical_bar(
+                    div()
+                        .id("markdown")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .px(px(36.))
+                        .py(px(24.))
+                        .child(div().w_full().flex().flex_col().gap(px(8.)).children(blocks)),
+                    theme,
+                )
             }
-            Content::Text { doc, list: state, .. } => {
+            Content::Text { doc, list: state, scroll, .. } => {
                 let doc = doc.clone();
                 let (faint, text, dark) = (theme.text_faint, theme.text, theme.dark);
-                let digits = doc.lines.len().to_string().len().max(2) as f32;
-                list(state.clone(), move |ix, _, _| {
-                    let line = doc.lines[ix].clone();
-                    let spans = doc.highlights.as_ref().and_then(|h| h.get(ix)).filter(|s| !s.is_empty());
-                    let content: AnyElement = match spans {
-                        Some(spans) => StyledText::new(line).with_highlights(highlight::styled(spans, dark)).into_any_element(),
-                        None if line.is_empty() => " ".into_any_element(),
-                        None => line.into_any_element(),
+                // Line numbers plus the left margin.
+                let gutter = doc.lines.to_string().len().max(2) as f32 * 8. + 26.;
+                let wrap = self.wrap;
+                let (rows, widest) = (doc.rows.len(), doc.widest);
+                let surface = theme.surface;
+                let sideways = scroll.0.borrow().base_handle.clone();
+                let render_row = move |ix: usize| -> Div {
+                    let row = &doc.rows[ix];
+                    let content: AnyElement = if !row.spans.is_empty() {
+                        StyledText::new(row.text.clone())
+                            .with_highlights(highlight::styled(&row.spans, dark))
+                            .into_any_element()
+                    } else if row.text.is_empty() {
+                        " ".into_any_element()
+                    } else {
+                        row.text.clone().into_any_element()
                     };
+                    // The row moves left when scrolled sideways; shift the line number
+                    // back so it stays put, painted over the text that slides under it.
+                    let shift = if wrap { px(0.) } else { -sideways.offset().x };
                     div()
+                        .relative()
                         .flex()
-                        .px(px(12.))
+                        .pr(px(12.))
                         .font_family("Consolas")
                         .text_size(px(13.))
-                        .line_height(px(20.))
+                        .line_height(px(ROW_HEIGHT))
+                        .child(div().flex_none().w(px(gutter)))
                         .child(
                             div()
-                                .flex_none()
-                                .w(px(digits * 8. + 14.))
+                                .text_color(text)
+                                .when(wrap, |d| d.flex_1().min_w_0())
+                                .when(!wrap, |d| d.flex_none().whitespace_nowrap())
+                                .child(content),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(shift)
+                                .w(px(gutter))
                                 .pr(px(14.))
                                 .text_right()
                                 .text_color(faint)
-                                .child((ix + 1).to_string()),
+                                .bg(surface)
+                                .child(row.line.map(|n| n.to_string()).unwrap_or_default()),
                         )
-                        .child(div().flex_1().min_w_0().text_color(text).child(content))
+                };
+                let color = theme.text_faint;
+                if wrap {
+                    div()
+                        .relative()
+                        .size_full()
+                        .child(
+                            list(state.clone(), move |ix, _, _| render_row(ix).w_full().into_any_element())
+                                .size_full()
+                                .py(px(8.)),
+                        )
+                        .child(scrollbar::vertical(
+                            Track::List { state: state.clone(), row: px(ROW_HEIGHT) },
+                            &self.drags,
+                            color,
+                            false,
+                        ))
                         .into_any_element()
-                })
-                .size_full()
-                .py(px(8.))
-                .into_any_element()
+                } else {
+                    let base = scroll.0.borrow().base_handle.clone();
+                    div()
+                        .relative()
+                        .size_full()
+                        .child(
+                            uniform_list("text-rows", rows, move |range, _, _| range.map(&render_row).collect())
+                                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                                .with_width_from_item(Some(widest))
+                                .track_scroll(scroll.clone())
+                                .size_full()
+                                .pt(px(8.))
+                                .pb(px(8. + scrollbar::THICKNESS)),
+                        )
+                        .child(scrollbar::vertical(Track::Handle(base.clone()), &self.drags, color, true))
+                        .child(scrollbar::horizontal(base, &self.drags, color))
+                        .into_any_element()
+                }
             }
             Content::Table { sheets, widths } => self.render_table(sheets.clone(), widths.clone(), theme, cx),
             Content::Doc { blocks, images } => {
@@ -875,15 +1046,17 @@ impl Preview {
                     .zip(images.iter())
                     .map(|(block, image)| doc_block(block, image.clone(), theme))
                     .collect();
-                div()
-                    .id("document")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .px(px(40.))
-                    .py(px(28.))
-                    .child(div().w_full().flex().flex_col().gap(px(6.)).children(elements))
-                    .into_any_element()
+                self.with_vertical_bar(
+                    div()
+                        .id("document")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .px(px(40.))
+                        .py(px(28.))
+                        .child(div().w_full().flex().flex_col().gap(px(6.)).children(elements)),
+                    theme,
+                )
             }
             Content::Folder { entries, total } => {
                 let rows = entries.iter().map(|(name, dir, size)| {
@@ -898,10 +1071,11 @@ impl Preview {
                         .child(div().flex_1().min_w_0().truncate().child(name.clone()))
                         .when(!*dir, |d| d.child(div().text_color(theme.text_faint).text_size(px(12.)).child(human_size(*size))))
                 });
-                div()
+                let body = div()
                     .id("folder")
                     .size_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .py(px(6.))
                     .children(rows)
                     .when(*total > entries.len(), |d| {
@@ -913,8 +1087,8 @@ impl Preview {
                                 .text_color(theme.text_faint)
                                 .child(format!("……还有 {} 项", total - entries.len())),
                         )
-                    })
-                    .into_any_element()
+                    });
+                self.with_vertical_bar(body, theme)
             }
             Content::Info(type_name) => {
                 let type_name = type_name.clone();
@@ -953,6 +1127,16 @@ impl Preview {
         }
     }
 
+    /// `body` (which scrolls with `self.scroll`) plus a vertical scrollbar.
+    fn with_vertical_bar(&self, body: impl IntoElement, theme: &Theme) -> AnyElement {
+        div()
+            .relative()
+            .size_full()
+            .child(body)
+            .child(scrollbar::vertical(Track::Handle(self.scroll.clone()), &self.drags, theme.text_faint, false))
+            .into_any_element()
+    }
+
     fn render_table(&mut self, sheets: Arc<Vec<Sheet>>, widths: Arc<Vec<Vec<f32>>>, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let index = self.sheet.min(sheets.len().saturating_sub(1));
         let Some(sheet) = sheets.get(index) else {
@@ -978,15 +1162,23 @@ impl Preview {
                 .when(header, |d| d.bg(colors.3).text_color(colors.1).justify_center())
                 .child(div().min_w_0().truncate().child(text))
         };
+        // Row numbers stay put while the columns scroll sideways: they're painted
+        // last, shifted back by the horizontal offset.
+        let sideways = self.scroll.clone();
+        let row_number = move |text: SharedString| {
+            cell(num_w, text, true).absolute().top_0().left(-sideways.offset().x)
+        };
         let header = div()
+            .relative()
             .flex_none()
             .h(px(28.))
             .flex()
             .border_b_1()
             .border_color(colors.2)
             .text_size(px(12.))
-            .child(cell(num_w, "".into(), true))
-            .children(col_widths.iter().enumerate().map(|(i, w)| cell(*w, column_name(i).into(), true)));
+            .child(div().flex_none().w(px(num_w)))
+            .children(col_widths.iter().enumerate().map(|(i, w)| cell(*w, column_name(i).into(), true)))
+            .child(row_number("".into()));
 
         let sheets_for_rows = sheets.clone();
         let widths_for_rows = col_widths.clone();
@@ -996,6 +1188,7 @@ impl Preview {
                 .map(|r| {
                     let row = &sheet.rows[r];
                     div()
+                        .relative()
                         .h(px(28.))
                         .flex()
                         .border_b_1()
@@ -1003,15 +1196,20 @@ impl Preview {
                         .text_size(px(12.5))
                         .text_color(colors.0)
                         .when(r == 0, |d| d.font_weight(FontWeight::SEMIBOLD))
-                        .child(cell(num_w, (r + 1).to_string().into(), true))
+                        .child(div().flex_none().w(px(num_w)))
                         .children(widths_for_rows.iter().enumerate().map(|(c, w)| {
                             let value = row.get(c).map(|v| v.replace(['\r', '\n'], " ")).unwrap_or_default();
                             cell(*w, value.into(), false)
                         }))
+                        .child(row_number((r + 1).to_string().into()))
                 })
                 .collect()
         })
+        .track_scroll(self.rows_scroll.clone())
         .flex_1();
+        // Each container scrolls only its own axis (GPUI would otherwise map the wheel across).
+        let mut rows = rows;
+        rows.style().restrict_scroll_to_axis = Some(true);
 
         let tabs = (sheets.len() > 1).then(|| {
             div()
@@ -1038,23 +1236,34 @@ impl Preview {
                         .when(!selected, |d| d.text_color(theme.text_muted).hover(|s| s.bg(theme.row_hover)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.sheet = i;
+                            this.scroll.set_offset(Default::default());
+                            this.rows_scroll = UniformListScrollHandle::new();
                             cx.notify();
                         }))
                         .child(s.name.clone())
                 }))
         });
 
+        let mut columns = div()
+            .id("table-scroll")
+            .size_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll)
+            .child(div().w(px(total)).h_full().flex().flex_col().child(header).child(rows));
+        columns.style().restrict_scroll_to_axis = Some(true);
+        let rows_handle = self.rows_scroll.0.borrow().base_handle.clone();
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .id("table-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_x_scroll()
-                    .child(div().w(px(total)).h_full().flex().flex_col().child(header).child(rows)),
+                    .child(columns)
+                    .child(scrollbar::vertical(Track::Handle(rows_handle), &self.drags, theme.text_faint, true))
+                    .child(scrollbar::horizontal(self.scroll.clone(), &self.drags, theme.text_faint)),
             )
             .children(tabs)
             .into_any_element()
@@ -1366,5 +1575,23 @@ mod tests {
         assert_eq!(column_name(26), "AA");
         assert_eq!(column_name(27), "AB");
         assert_eq!(human_size(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn long_lines_split_into_rows() {
+        let long = format!("\"{}\"", "中".repeat(1000)); // 3002 bytes
+        let doc = text_doc(&format!("a\n{long}\nb"), highlight::lang_for_ext("json"));
+        assert_eq!(doc.lines, 3);
+        assert_eq!(doc.rows.len(), 4);
+        let numbers: Vec<_> = doc.rows.iter().map(|r| r.line).collect();
+        assert_eq!(numbers, [Some(1), Some(2), None, Some(3)]);
+        // Pieces end on char boundaries and keep their highlight, re-based to 0.
+        assert_eq!(doc.rows[1].text.len() + doc.rows[2].text.len(), long.len());
+        for row in &doc.rows[1..3] {
+            assert_eq!(row.spans.len(), 1);
+            assert_eq!(row.spans[0].0, 0..row.text.len());
+        }
+        assert_eq!(doc.widest, 1);
+        assert_eq!(columns("ab中"), 4);
     }
 }

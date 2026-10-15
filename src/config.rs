@@ -128,6 +128,8 @@ pub struct Settings {
     pub last_update_check: u64,
     /// Press Space in Explorer / on the desktop to preview the selected file.
     pub space_preview: bool,
+    /// Wrap long lines in text previews (otherwise scroll sideways).
+    pub preview_wrap: bool,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
     pub ffmpeg_path: String,
 }
@@ -236,6 +238,7 @@ impl Default for Settings {
             auto_check_update: true,
             last_update_check: 0,
             space_preview: true,
+            preview_wrap: true,
             ffmpeg_path: String::new(),
         }
     }
