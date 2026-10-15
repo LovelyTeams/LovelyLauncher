@@ -222,6 +222,67 @@ pub fn place_window(raw: isize, width: f32, height: f32, anchor: Option<isize>) 
     }
 }
 
+/// Show a borderless popup without activating it, above everything: `size` logical
+/// pixels square, in the bottom-right corner of the work area under the cursor.
+pub fn place_corner_popup(raw: isize, size: f32, margin: f32) {
+    use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
+    let h = hwnd(raw);
+    unsafe {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x.max(96) as f32 / 96.;
+        let side = (size * scale) as i32;
+        let gap = (margin * scale) as i32;
+        let work = info.rcWork;
+        let (x, y) = (work.right - side - gap, work.bottom - side - gap);
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), x, y, side, side, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+/// The pointer's position relative to a window's top-left corner, in logical pixels.
+pub fn cursor_in_window(raw: isize) -> Option<(f32, f32)> {
+    let h = hwnd(raw);
+    let mut cursor = POINT::default();
+    let mut rect = RECT::default();
+    unsafe {
+        GetCursorPos(&mut cursor).ok()?;
+        GetWindowRect(h, &mut rect).ok()?;
+    }
+    let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(h) }.max(96) as f32 / 96.;
+    Some(((cursor.x - rect.left) as f32 / scale, (cursor.y - rect.top) as f32 / scale))
+}
+
+/// Unassigned virtual key that [`send_mask_key`] presses.
+pub const MASK_KEY: u16 = 0xE8;
+
+/// Press and release a key nobody listens to. Releasing Alt right after a lone Alt
+/// press opens the active window's menu bar; this makes it an "Alt + something" instead.
+pub fn send_mask_key() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+    };
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VIRTUAL_KEY(MASK_KEY), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 /// Explorer's description of a file type, e.g. "Markdown 源文件".
 pub fn type_name(path: &Path) -> Option<String> {
     let wide = HSTRING::from(path.as_os_str());

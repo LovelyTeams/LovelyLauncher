@@ -1235,6 +1235,22 @@ impl Launcher {
             )
             .child(
                 toggle(
+                    "alt-ring",
+                    "按住 Alt 弹出圆环菜单",
+                    "单独按住 Alt 约 0.3 秒，屏幕右下角会弹出常用工具的圆环（收藏的排在前面）；指向图标松开 Alt 即可打开",
+                    settings.alt_ring,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    let on = !this.config.settings.alt_ring;
+                    this.config.settings.alt_ring = on;
+                    this.config.save();
+                    crate::preview::hook::RING_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+                    cx.notify();
+                })),
+            )
+            .child(
+                toggle(
                     "everything",
                     "Everything 文件搜索",
                     if crate::everything::is_running() {

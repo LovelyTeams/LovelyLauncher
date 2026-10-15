@@ -23,8 +23,8 @@ use windows::{
         },
         UI::{
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU,
-                VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
+                GetAsyncKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LMENU, VK_LWIN, VK_MENU,
+                VK_RIGHT, VK_RMENU, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
             },
             Shell::{
                 CSIDL_DESKTOP, IFolderView, IShellBrowser, IShellItemArray, IShellWindows,
@@ -34,8 +34,8 @@ use windows::{
             WindowsAndMessaging::{
                 CallNextHookEx, DispatchMessageW, GUITHREADINFO, GetClassNameW,
                 GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId,
-                HC_ACTION, IsWindowVisible, KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW,
-                TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+                HC_ACTION, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, SetWindowsHookExW,
+                TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             },
         },
     },
@@ -50,6 +50,11 @@ pub enum HookEvent {
     Navigate { hwnd: isize },
     /// Esc in the file list while a preview is open.
     Close,
+    /// Alt went down on its own (no Ctrl / Shift / Win): maybe the start of a hold.
+    AltDown,
+    /// Another key was pressed while Alt is down: it's a shortcut, not a hold.
+    AltCancel,
+    AltUp,
 }
 
 static SENDER: OnceLock<Box<dyn Fn(HookEvent) + Send + Sync>> = OnceLock::new();
@@ -57,6 +62,11 @@ static SENDER: OnceLock<Box<dyn Fn(HookEvent) + Send + Sync>> = OnceLock::new();
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 /// Whether a preview window is currently showing.
 pub static PREVIEW_OPEN: AtomicBool = AtomicBool::new(false);
+/// Whether holding Alt shows the app ring (Settings → 通用).
+pub static RING_ENABLED: AtomicBool = AtomicBool::new(true);
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+/// Alt is down and nothing else has been pressed since.
+static ALT_ALONE: AtomicBool = AtomicBool::new(false);
 
 /// Install the hook on its own thread (low-level hooks need a message loop).
 pub fn start<T: Send + 'static>(tx: UnboundedSender<T>, wrap: fn(HookEvent) -> T) {
@@ -89,7 +99,34 @@ fn key_down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
+/// Watch Alt for the app ring. Never swallows anything: Alt shortcuts work as usual.
+fn track_alt(vk: u16, msg: u32, injected: bool) {
+    let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+    if vk == VK_MENU.0 || vk == VK_LMENU.0 || vk == VK_RMENU.0 {
+        if down && !ALT_DOWN.swap(true, Ordering::Relaxed) {
+            // Ctrl+Alt (AltGr), Shift+Alt and Win+Alt are shortcuts.
+            let others = [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN].iter().any(|m| key_down(m.0 as i32));
+            ALT_ALONE.store(!others, Ordering::Relaxed);
+            if !others {
+                send(HookEvent::AltDown);
+            }
+        } else if up && ALT_DOWN.swap(false, Ordering::Relaxed) {
+            ALT_ALONE.store(false, Ordering::Relaxed);
+            send(HookEvent::AltUp);
+        }
+    } else if down && ALT_DOWN.load(Ordering::Relaxed) && !(injected && vk == crate::win::MASK_KEY) {
+        if ALT_ALONE.swap(false, Ordering::Relaxed) {
+            send(HookEvent::AltCancel);
+        }
+    }
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && RING_ENABLED.load(Ordering::Relaxed) {
+        let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        track_alt(kb.vkCode as u16, wparam.0 as u32, kb.flags.0 & LLKHF_INJECTED.0 != 0);
+    }
     if code == HC_ACTION as i32 && ENABLED.load(Ordering::Relaxed) {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let msg = wparam.0 as u32;

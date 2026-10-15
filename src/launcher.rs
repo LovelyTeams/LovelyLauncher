@@ -125,6 +125,9 @@ impl QuickAction {
     }
 }
 
+/// How long Alt has to be held on its own before the ring pops up.
+const RING_HOLD: Duration = Duration::from_millis(300);
+
 /// Something the user can activate.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
@@ -310,6 +313,10 @@ pub struct Launcher {
     pub(crate) ai_scroll: ScrollHandle,
     pub(crate) update: UpdateState,
     pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
+    /// The Alt ring popup, created on first use and then kept (hidden) for reuse.
+    ring: Option<gpui::WindowHandle<crate::ring::Ring>>,
+    /// Bumped on every Alt event, so a pending "show the ring" timer can tell it's stale.
+    ring_seq: u64,
     pub(crate) body_scroll: ScrollHandle,
     pub(crate) apps: Arc<Vec<AppEntry>>,
     icons: HashMap<String, IconSlot>,
@@ -409,6 +416,8 @@ impl Launcher {
             ai_scroll: ScrollHandle::new(),
             update: UpdateState::default(),
             preview: None,
+            ring: None,
+            ring_seq: 0,
             body_scroll: ScrollHandle::new(),
             apps: Arc::new(Vec::new()),
             icons: HashMap::new(),
@@ -888,6 +897,102 @@ impl Launcher {
                 }
             }
             HookEvent::Close => self.close_preview(cx),
+            HookEvent::AltDown => {
+                self.ring_seq += 1;
+                let seq = self.ring_seq;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(RING_HOLD).await;
+                    this.update(cx, |this, cx| {
+                        if this.ring_seq == seq {
+                            this.show_ring(cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            HookEvent::AltCancel => {
+                self.ring_seq += 1;
+                if let Some(ring) = self.ring {
+                    ring.update(cx, |ring, _, cx| ring.close(cx)).ok();
+                }
+            }
+            HookEvent::AltUp => {
+                self.ring_seq += 1;
+                let chosen = self.ring.and_then(|ring| ring.update(cx, |ring, _, cx| ring.release(cx)).ok().flatten());
+                if let Some(id) = chosen {
+                    self.launch_tool(&id, cx);
+                }
+            }
+        }
+    }
+
+    /// Tools for the Alt ring: favourites first, then recently used, then the rest.
+    fn ring_tools(&self) -> Vec<&crate::config::Tool> {
+        let tools = &self.config.tools;
+        let mut picked: Vec<&crate::config::Tool> = tools.iter().filter(|t| t.favorite).collect();
+        let recent = self
+            .config
+            .history
+            .iter()
+            .filter_map(|h| h.key.strip_prefix("tool:"))
+            .filter_map(|id| tools.iter().find(|t| t.id == id));
+        for tool in recent.chain(tools.iter()) {
+            if picked.len() >= crate::ring::MAX_ITEMS {
+                break;
+            }
+            if !picked.iter().any(|p| p.id == tool.id) {
+                picked.push(tool);
+            }
+        }
+        picked.truncate(crate::ring::MAX_ITEMS);
+        picked
+    }
+
+    /// Alt has been held on its own long enough: pop up the ring of tools.
+    fn show_ring(&mut self, cx: &mut Context<Self>) {
+        let items: Vec<crate::ring::RingItem> = self
+            .ring_tools()
+            .into_iter()
+            .map(|t| crate::ring::RingItem {
+                id: t.id.clone(),
+                name: t.name.clone().into(),
+                visual: Self::tool_visual(t),
+            })
+            .collect();
+        // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
+        win::send_mask_key();
+        if let Some(ring) = self.ring {
+            if ring.update(cx, |ring, _, cx| ring.open(items, cx)).is_ok() {
+                return;
+            }
+            self.ring = None;
+            return;
+        }
+        let launcher = cx.weak_entity();
+        let size = crate::ring::SIZE;
+        let options = gpui::WindowOptions {
+            window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                gpui::point(gpui::px(-10000.), gpui::px(-10000.)),
+                gpui::size(gpui::px(size), gpui::px(size)),
+            ))),
+            titlebar: None,
+            kind: gpui::WindowKind::PopUp,
+            window_background: gpui::WindowBackgroundAppearance::Transparent,
+            show: false,
+            focus: false,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            app_id: Some("LovelyLauncher".into()),
+            ..Default::default()
+        };
+        match cx.open_window(options, move |window, cx| cx.new(|_| crate::ring::Ring::new(launcher, window))) {
+            Ok(handle) => {
+                self.ring = Some(handle);
+                handle.update(cx, |ring, _, cx| ring.open(items, cx)).ok();
+            }
+            Err(err) => self.show_toast(format!("无法显示圆环菜单：{err}"), true, cx),
         }
     }
 
@@ -1499,24 +1604,9 @@ impl Launcher {
         let mut hide = true;
         match &target {
             Target::Tool(id) => {
-                let Some(tool) = self.config.tools.iter().find(|t| &t.id == id).cloned() else {
-                    return;
-                };
-                if self.downloads.contains_key(id) {
-                    self.show_toast(format!("“{}”正在下载，完成后会自动打开", tool.name), false, cx);
+                if !self.launch_tool_as(id, admin, cx) {
                     return;
                 }
-                if Self::needs_download(&tool) {
-                    self.start_download(&tool.id, true, cx);
-                    return;
-                }
-                let program = if tool.target.trim() == "terminal" {
-                    self.terminal()
-                } else {
-                    tool.target.clone()
-                };
-                self.record(&target, &tool.name);
-                self.spawn_launch(program, tool.args.clone(), tool.workdir.clone(), admin, cx);
             }
             Target::App(path) => {
                 let name = path
@@ -1564,6 +1654,36 @@ impl Launcher {
             self.hide(window, cx);
         }
         cx.notify();
+    }
+
+    /// Open a tool by id (from the ring, or the main window).
+    pub fn launch_tool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.launch_tool_as(id, false, cx) {
+            self.config.save();
+        }
+    }
+
+    /// Returns false when the tool wasn't started (unknown, or downloading first).
+    fn launch_tool_as(&mut self, id: &str, admin: bool, cx: &mut Context<Self>) -> bool {
+        let Some(tool) = self.config.tools.iter().find(|t| t.id == id).cloned() else {
+            return false;
+        };
+        if self.downloads.contains_key(id) {
+            self.show_toast(format!("“{}”正在下载，完成后会自动打开", tool.name), false, cx);
+            return false;
+        }
+        if Self::needs_download(&tool) {
+            self.start_download(&tool.id, true, cx);
+            return false;
+        }
+        let program = if tool.target.trim() == "terminal" {
+            self.terminal()
+        } else {
+            tool.target.clone()
+        };
+        self.record(&Target::Tool(id.to_string()), &tool.name);
+        self.spawn_launch(program, tool.args.clone(), tool.workdir.clone(), admin, cx);
+        true
     }
 
     fn record(&mut self, target: &Target, name: &str) {

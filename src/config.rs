@@ -130,6 +130,8 @@ pub struct Settings {
     pub space_preview: bool,
     /// Wrap long lines in text previews (otherwise scroll sideways).
     pub preview_wrap: bool,
+    /// Hold Alt to pop up a ring of favourite tools in the bottom-right corner.
+    pub alt_ring: bool,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
     pub ffmpeg_path: String,
 }
@@ -239,6 +241,7 @@ impl Default for Settings {
             last_update_check: 0,
             space_preview: true,
             preview_wrap: true,
+            alt_ring: true,
             ffmpeg_path: String::new(),
         }
     }
