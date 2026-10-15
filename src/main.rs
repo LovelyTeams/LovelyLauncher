@@ -21,6 +21,7 @@ mod system;
 mod theme;
 mod update;
 mod view;
+mod wallpaper;
 mod win;
 
 use futures::StreamExt;

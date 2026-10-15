@@ -67,6 +67,11 @@ impl Spring {
         Self { x, v: 0., target: x, stiffness, damping }
     }
 
+    /// A spring by its damping ratio: 1 settles without overshoot, lower bounces more.
+    fn bouncy(x: f32, stiffness: f32, zeta: f32) -> Self {
+        Self::new(x, stiffness, 2. * zeta * stiffness.sqrt())
+    }
+
     fn step(&mut self, dt: f32) {
         let mut left = dt;
         while left > 0. {
@@ -75,6 +80,29 @@ impl Spring {
             self.v += a * h;
             self.x += self.v * h;
             left -= h;
+        }
+    }
+}
+
+/// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild (Settings → 通用).
+#[derive(Clone, Copy)]
+struct Bounce {
+    /// Damping ratios for the pop-in, the icons, and the goo's head.
+    pop: f32,
+    icon: f32,
+    head: f32,
+    /// How hard the jelly is kicked into squash and stretch, and how long it wobbles.
+    kick: f32,
+    wobble: f32,
+}
+
+impl Bounce {
+    fn level(level: u8) -> Self {
+        match level {
+            0 => Self { pop: 1., icon: 1., head: 1., kick: 0., wobble: 1. },
+            1 => Self { pop: 0.6, icon: 0.6, head: 0.75, kick: 0.5, wobble: 0.4 },
+            3 => Self { pop: 0.25, icon: 0.24, head: 0.4, kick: 1.7, wobble: 0.14 },
+            _ => Self { pop: 0.4, icon: 0.37, head: 0.59, kick: 1., wobble: 0.25 },
         }
     }
 }
@@ -110,6 +138,7 @@ pub struct Ring {
     /// The centre's picture pops when the selection changes.
     centre_pop: Spring,
     selected: Option<usize>,
+    bounce: Bounce,
     /// The app's mascot, shown in the centre while nothing is pointed at.
     logo: Option<Arc<RenderImage>>,
 }
@@ -151,23 +180,28 @@ impl Ring {
             pull_y: Spring::new(0., 300., 18.),
             centre_pop: Spring::new(1., 500., 16.),
             selected: None,
+            bounce: Bounce::level(2),
             logo: None,
         }
     }
 
     /// Pop the ring up in the corner of the monitor under the cursor.
-    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, cx: &mut Context<Self>) {
+    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, bounce: u8, cx: &mut Context<Self>) {
+        let b = Bounce::level(bounce);
+        self.bounce = b;
         let now = Instant::now();
         self.logo = Some(logo);
-        self.icons = items.iter().map(|_| Spring::new(0., 420., 15.)).collect();
+        self.icons = items.iter().map(|_| Spring::bouncy(0., 420., b.icon)).collect();
         self.items = items;
         self.selected = None;
         self.phase = Phase::Open;
         self.opened = now;
         self.last_frame = now;
-        self.scale = Spring { x: 0.3, v: 0., target: 1., stiffness: 260., damping: 13. };
+        self.scale = Spring { target: 1., ..Spring::bouncy(0.3, 260., b.pop) };
         // A kick sideways so it wobbles while it grows.
-        self.squash = Spring { x: 0., v: 2.6, target: 0., stiffness: 200., damping: 7. };
+        self.squash = Spring { v: 2.6 * b.kick, ..Spring::bouncy(0., 200., b.wobble) };
+        self.head = Spring { x: self.head.x, ..Spring::bouncy(self.head.x, HEAD.0, b.head) };
+        self.centre_pop = Spring::bouncy(1., 500., b.icon);
         self.bubble = Spring::new(0., 380., 20.);
         self.pull_x = Spring::new(0., 300., 18.);
         self.pull_y = Spring::new(0., 300., 18.);
@@ -197,7 +231,7 @@ impl Ring {
         self.scale.target = 0.;
         self.scale.stiffness = 520.;
         self.scale.damping = 34.;
-        self.squash.v -= 1.2;
+        self.squash.v -= 1.2 * self.bounce.kick;
         cx.notify();
     }
 
@@ -236,7 +270,8 @@ impl Ring {
                 }
             }
             // Every change of selection jiggles the jelly a little.
-            self.squash.v += if self.squash.x > 0. { -0.9 } else { 0.9 };
+            let kick = 0.9 * self.bounce.kick;
+            self.squash.v += if self.squash.x > 0. { -kick } else { kick };
         }
         self.bubble.target = if selected.is_some() { 1. } else { 0. };
         self.selected = selected;

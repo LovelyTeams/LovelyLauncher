@@ -1859,6 +1859,22 @@ impl Render for Launcher {
         let dialog = self.render_dialog(&theme, window, cx);
         let menu = self.render_menu(&theme, cx);
         let toast = self.render_toast(&theme);
+        // The wallpaper, under a veil of the window colour so the content stays readable.
+        let wallpaper = self.wallpaper_image.clone().map(|image| {
+            let settings = &self.config.settings.wallpaper;
+            let fit = match settings.fit {
+                crate::config::WallpaperFit::Cover => gpui::ObjectFit::Cover,
+                crate::config::WallpaperFit::Contain => gpui::ObjectFit::Contain,
+                crate::config::WallpaperFit::Stretch => gpui::ObjectFit::Fill,
+            };
+            let veil = gpui::Hsla { a: settings.veil.min(95) as f32 / 100., ..theme.window_bg };
+            div()
+                .absolute()
+                .inset_0()
+                .overflow_hidden()
+                .child(img(image).size_full().object_fit(fit))
+                .child(div().absolute().inset_0().bg(veil))
+        });
 
         div()
             .id("launcher-root")
@@ -1904,6 +1920,7 @@ impl Render for Launcher {
             .bg(theme.window_bg)
             .text_color(theme.text)
             .text_size(px(14.))
+            .children(wallpaper)
             .child(content)
             .children(dialog)
             .children(menu)

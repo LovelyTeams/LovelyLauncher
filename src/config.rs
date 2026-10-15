@@ -139,8 +139,49 @@ pub struct Settings {
     pub ring_skip_fullscreen: bool,
     /// …or while one of these programs (exe file names) is in front.
     pub ring_excluded: Vec<String>,
+    /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
+    pub ring_bounce: u8,
+    /// A picture or video behind the main window.
+    pub wallpaper: Wallpaper,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
     pub ffmpeg_path: String,
+}
+
+/// Background picture or video for the main window, and how it is shown.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Wallpaper {
+    /// Image or video file; empty for none.
+    pub path: String,
+    pub fit: WallpaperFit,
+    /// Blur strength, 0–40.
+    pub blur: u8,
+    /// -50 (darker) to +50 (lighter).
+    pub brightness: i8,
+    /// Percent: 0 grey, 100 unchanged, 200 vivid.
+    pub saturation: u8,
+    /// How much of the theme's background colour covers it, in percent (0–90).
+    pub veil: u8,
+    /// Video playback speed.
+    pub speed: f32,
+}
+
+impl Default for Wallpaper {
+    fn default() -> Self {
+        Self { path: String::new(), fit: WallpaperFit::Cover, blur: 0, brightness: 0, saturation: 100, veil: 45, speed: 1. }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WallpaperFit {
+    /// Fill the window, cropping the edges.
+    #[default]
+    Cover,
+    /// Show it whole.
+    Contain,
+    /// Stretch to the window.
+    Stretch,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +292,8 @@ impl Default for Settings {
             alt_ring: true,
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
+            ring_bounce: 2,
+            wallpaper: Wallpaper::default(),
             ffmpeg_path: String::new(),
         }
     }

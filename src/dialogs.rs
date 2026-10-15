@@ -213,6 +213,55 @@ fn switch(id: impl Into<gpui::ElementId>, on: bool, theme: &Theme) -> Stateful<D
         )
 }
 
+/// Drag payload of a settings slider (its element id).
+#[derive(Clone)]
+struct SliderDrag(&'static str);
+
+/// One option of a segmented choice.
+fn segment(id: (&'static str, usize), label: &'static str, selected: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_1()
+        .h(px(28.))
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.5))
+        .cursor_pointer()
+        .when(selected, |d| d.bg(theme.panel_hover).shadow(soft_shadow(theme)).text_color(theme.accent))
+        .when(!selected, |d| d.text_color(theme.text_muted).hover(|s| s.text_color(theme.text)))
+        .child(label)
+}
+
+/// A settings row: title (and a hint) on the left, a segmented choice on the right.
+fn choice_row(title: &'static str, hint: &'static str, segments: Vec<AnyElement>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().text_size(px(13.5)).child(title))
+                .when(!hint.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(theme.text_faint).child(hint))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(270.))
+                .p(px(3.))
+                .rounded(px(9.))
+                .bg(theme.kbd_bg)
+                .flex()
+                .gap(px(2.))
+                .children(segments),
+        )
+}
+
 fn label(text: &'static str, theme: &Theme) -> Div {
     div()
         .text_size(px(12.5))
@@ -1113,6 +1162,287 @@ impl Launcher {
             .into_any_element()
     }
 
+    /// 壁纸: choose a picture or video and tune how it is shown. Changes apply live.
+    fn render_wallpaper_settings(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::config::{Wallpaper, WallpaperFit};
+        use crate::wallpaper::Kind;
+        let w = &self.config.settings.wallpaper;
+        let kind = crate::wallpaper::kind(&w.path);
+        let file = std::path::Path::new(&w.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let small_button = |id: &'static str, text: &'static str, accent: bool| {
+            div()
+                .id(id)
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(8.))
+                .border_1()
+                .flex()
+                .items_center()
+                .text_size(px(12.5))
+                .cursor_pointer()
+                .when(accent, |d| d.border_color(theme.accent).bg(theme.accent_soft).text_color(theme.accent))
+                .when(!accent, |d| d.border_color(theme.border).bg(theme.panel).hover(|s| s.border_color(theme.accent)))
+                .child(text)
+        };
+        let mut section_el = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.accent)
+                    .child("壁纸"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.5)).child("背景图片 / 视频"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_faint)
+                                    .truncate()
+                                    .child(if file.is_empty() {
+                                        "未设置。支持 png / jpg / webp / bmp 图片，以及 mp4 / webm / mov / gif 等视频".to_string()
+                                    } else {
+                                        match kind {
+                                            Some(Kind::Video) => format!("视频：{file}"),
+                                            _ => format!("图片：{file}"),
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        small_button("wallpaper-pick", if file.is_empty() { "选择…" } else { "更换…" }, true)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.pick_wallpaper(window, cx))),
+                    )
+                    .when(!file.is_empty(), |d| {
+                        d.child(small_button("wallpaper-remove", "移除", false).on_click(cx.listener(
+                            |this, _: &ClickEvent, window, cx| {
+                                this.config.settings.wallpaper.path.clear();
+                                this.config.save();
+                                this.reload_wallpaper(window, cx);
+                            },
+                        )))
+                    }),
+            );
+        if let Some(err) = self.wallpaper_error.clone() {
+            let needs_ffmpeg = kind == Some(Kind::Video) && cx.global::<crate::preview::ffmpeg::FfmpegState>().path.is_none();
+            section_el = section_el.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(theme.danger).child(err))
+                    .when(needs_ffmpeg, |d| {
+                        d.child(small_button("wallpaper-ffmpeg", "下载 FFmpeg", true).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| this.download_ffmpeg(cx),
+                        )))
+                        .child(small_button("wallpaper-ffmpeg-pick", "选择 ffmpeg.exe", false).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| this.choose_ffmpeg(cx),
+                        )))
+                    })
+                    .child(small_button("wallpaper-retry", "重新加载", false).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.reload_wallpaper(window, cx),
+                    ))),
+            );
+        }
+        if kind.is_none() {
+            return section_el.into_any_element();
+        }
+
+        let fits = [("填满", WallpaperFit::Cover), ("适应", WallpaperFit::Contain), ("拉伸", WallpaperFit::Stretch)]
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (label, fit))| {
+                segment(("wallpaper-fit", ix), label, w.fit == fit, theme)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.config.settings.wallpaper.fit = fit;
+                        this.config.save();
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        section_el = section_el
+            .child(choice_row("填充方式", "", fits, theme))
+            .child(self.slider_row(
+                "wallpaper-blur",
+                "模糊",
+                format!("{}", w.blur),
+                w.blur as f32 / 40.,
+                theme,
+                cx,
+                |w, f| w.blur = (f * 40.).round() as u8,
+            ))
+            .child(self.slider_row(
+                "wallpaper-brightness",
+                "亮度",
+                format!("{:+}%", w.brightness),
+                (w.brightness as f32 + 50.) / 100.,
+                theme,
+                cx,
+                |w, f| w.brightness = (f * 100. - 50.).round() as i8,
+            ))
+            .child(self.slider_row(
+                "wallpaper-saturation",
+                "饱和度",
+                format!("{}%", w.saturation),
+                w.saturation as f32 / 200.,
+                theme,
+                cx,
+                |w, f| w.saturation = (f * 200.).round() as u8,
+            ))
+            .child(self.slider_row(
+                "wallpaper-veil",
+                "遮罩浓度",
+                format!("{}%", w.veil),
+                w.veil as f32 / 90.,
+                theme,
+                cx,
+                |w, f| w.veil = (f * 90.).round() as u8,
+            ))
+            .child(div().text_size(px(12.)).text_color(theme.text_faint).child("遮罩越浓，壁纸越淡、文字越清楚"));
+        if kind == Some(Kind::Video) {
+            let speeds = [("0.5×", 0.5f32), ("1×", 1.), ("1.5×", 1.5), ("2×", 2.)]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (label, speed))| {
+                    segment(("wallpaper-speed", ix), label, (w.speed - speed).abs() < 0.01, theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.config.settings.wallpaper.speed = speed;
+                            this.config.save();
+                            this.reload_wallpaper(window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            section_el = section_el.child(choice_row("播放速度", "视频静音循环播放，窗口隐藏时自动暂停", speeds, theme));
+        }
+        section_el
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .id("wallpaper-defaults")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(theme.accent)
+                        .hover(|s| s.bg(theme.accent_soft))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            let path = std::mem::take(&mut this.config.settings.wallpaper.path);
+                            this.config.settings.wallpaper = Wallpaper { path, ..Default::default() };
+                            this.config.save();
+                            this.reload_wallpaper(window, cx);
+                        }))
+                        .child(icon("reset", 12., theme.accent))
+                        .child("恢复默认参数"),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Title, a slider, and the current value. `set` maps the slider position (0–1)
+    /// onto the wallpaper setting; the wallpaper is rebuilt as it moves.
+    #[allow(clippy::too_many_arguments)]
+    fn slider_row(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        value: String,
+        fraction: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        set: fn(&mut crate::config::Wallpaper, f32),
+    ) -> Div {
+        let fraction = fraction.clamp(0., 1.);
+        let bounds = std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::<gpui::Pixels>::default()));
+        let measured = bounds.clone();
+        let apply = move |this: &mut Launcher, f: f32, window: &mut Window, cx: &mut Context<Launcher>| {
+            set(&mut this.config.settings.wallpaper, f.clamp(0., 1.));
+            this.save_soon(cx);
+            this.reload_wallpaper(window, cx);
+            cx.notify();
+        };
+        let slider = div()
+            .id(id)
+            .flex_none()
+            .w(px(210.))
+            .h(px(22.))
+            .relative()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(
+                gpui::canvas(move |b, _, _| measured.set(b), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(theme.kbd_bg)
+                    .child(div().h_full().w(gpui::relative(fraction)).rounded_full().bg(theme.accent)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .left(gpui::relative(fraction))
+                    .ml(px(-8.))
+                    .size(px(16.))
+                    .rounded_full()
+                    .bg(gpui::white())
+                    .border_2()
+                    .border_color(theme.accent)
+                    .shadow(soft_shadow(theme)),
+            )
+            // Click anywhere on the track…
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    let b = bounds.get();
+                    if b.size.width > px(0.) {
+                        apply(this, (e.position.x - b.left()) / b.size.width, window, cx);
+                    }
+                }),
+            )
+            // …or drag along it.
+            .on_drag(SliderDrag(id), |_, _, _, cx| cx.new(|_| gpui::EmptyView))
+            .on_drag_move(cx.listener(move |this, e: &gpui::DragMoveEvent<SliderDrag>, window, cx| {
+                if e.drag(cx).0 == id && e.bounds.size.width > px(0.) {
+                    apply(this, (e.event.position.x - e.bounds.left()) / e.bounds.size.width, window, cx);
+                }
+            }));
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(div().flex_1().text_size(px(13.5)).child(title))
+            .child(slider)
+            .child(div().flex_none().w(px(44.)).text_right().text_size(px(12.5)).text_color(theme.text_muted).child(value))
+    }
+
     /// Programs that never get the Alt ring: chips to remove, plus quick picks from
     /// what's running and a file picker.
     fn render_ring_exclusions(&self, editor: &SettingsEditor, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -1368,6 +1698,7 @@ impl Launcher {
                         ),
                 )
             })
+            .child(self.render_wallpaper_settings(theme, cx))
             .child(
                 div()
                     .flex()
@@ -1465,7 +1796,18 @@ impl Launcher {
                 })),
             )
             .when(settings.alt_ring, |d| {
-                d.child(
+                let bounce = settings.ring_bounce.min(3) as usize;
+                let options = ["关闭", "轻柔", "标准", "夸张"].into_iter().enumerate().map(|(ix, label)| {
+                    segment(("ring-bounce", ix), label, ix == bounce, theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.config.settings.ring_bounce = ix as u8;
+                            this.config.save();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                });
+                d.child(choice_row("圆环弹性", "弹出、晃动和黏液拉伸的幅度", options.collect(), theme))
+                .child(
                     toggle(
                         "ring-fullscreen",
                         "全屏游戏、全屏视频时不弹出",

@@ -410,6 +410,14 @@ pub struct Launcher {
     pub(crate) tools_scroll: ScrollHandle,
     /// Scrolls the favourites when they are shown as tiles.
     pub(crate) fav_scroll: gpui::ScrollHandle,
+    /// The wallpaper as shown (for a video: its latest frame).
+    pub(crate) wallpaper_image: Option<Arc<RenderImage>>,
+    wallpaper_video: Option<crate::wallpaper::VideoPlayer>,
+    pub(crate) wallpaper_error: Option<SharedString>,
+    /// Bumped on every wallpaper change; outdated loads and frame pumps stop.
+    wallpaper_generation: u64,
+    /// Bumped on every settings change made by dragging; only the last one saves.
+    save_generation: u64,
     pub(crate) metrics: crate::view::Metrics,
     pub(crate) code_available: bool,
     /// Set while a native file dialog is open so hide-on-blur doesn't fire.
@@ -508,6 +516,11 @@ impl Launcher {
             everything_generation: 0,
             tools_scroll: ScrollHandle::new(),
             fav_scroll: gpui::ScrollHandle::new(),
+            wallpaper_image: None,
+            wallpaper_video: None,
+            wallpaper_error: None,
+            wallpaper_generation: 0,
+            save_generation: 0,
             metrics: Default::default(),
             code_available: false,
             prompting: false,
@@ -523,7 +536,174 @@ impl Launcher {
         }
         this.scan_apps(cx);
         this.schedule_update_check(cx);
+        this.reload_wallpaper(window, cx);
         this
+    }
+
+    // -----------------------------------------------------------------------
+    // Wallpaper
+
+    /// Save a little later, so dragging a slider doesn't write the file on every move.
+    pub fn save_soon(&mut self, cx: &mut Context<Self>) {
+        self.save_generation += 1;
+        let generation = self.save_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            this.update(cx, |this, _| {
+                if this.save_generation == generation {
+                    this.config.save();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// (Re)build the wallpaper from the settings. Quick successive changes (a slider
+    /// being dragged) collapse into one rebuild.
+    pub fn reload_wallpaper(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::wallpaper::{self, Kind, VideoPlayer};
+        self.wallpaper_generation += 1;
+        let generation = self.wallpaper_generation;
+        let settings = self.config.settings.wallpaper.clone();
+        let width = (f32::from(window.viewport_size().width) * window.scale_factor()) as u32;
+        let kind = wallpaper::kind(&settings.path);
+        if kind.is_none() {
+            self.set_wallpaper(None, None, None, window, cx);
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let current = this.read_with(cx, |this, _| this.wallpaper_generation == generation).unwrap_or(false);
+            if !current {
+                return;
+            }
+            let path = PathBuf::from(&settings.path);
+            match kind {
+                Some(Kind::Image) => {
+                    let result = cx.background_spawn(async move { wallpaper::render_image(&path, &settings) }).await;
+                    this.update_in(cx, |this, window, cx| {
+                        if this.wallpaper_generation != generation {
+                            return;
+                        }
+                        match result {
+                            Ok(img) => {
+                                let image = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
+                                this.set_wallpaper(Some(image), None, None, window, cx)
+                            }
+                            Err(err) => this.set_wallpaper(None, None, Some(err), window, cx),
+                        }
+                    })
+                    .ok();
+                }
+                Some(Kind::Video) => {
+                    let ffmpeg = this
+                        .read_with(cx, |_, cx| cx.global::<crate::preview::ffmpeg::FfmpegState>().path.clone())
+                        .ok()
+                        .flatten();
+                    let result = match ffmpeg {
+                        Some(ffmpeg) => {
+                            cx.background_spawn(async move { VideoPlayer::start(&ffmpeg, &path, &settings, width) }).await
+                        }
+                        None => Err("视频壁纸需要 FFmpeg".into()),
+                    };
+                    this.update_in(cx, |this, window, cx| {
+                        if this.wallpaper_generation != generation {
+                            return;
+                        }
+                        match result {
+                            Ok(player) => {
+                                this.set_wallpaper(None, Some(player), None, window, cx);
+                                this.pump_wallpaper_video(generation, window, cx);
+                            }
+                            Err(err) => this.set_wallpaper(None, None, Some(err), window, cx),
+                        }
+                    })
+                    .ok();
+                }
+                None => {}
+            }
+        })
+        .detach();
+    }
+
+    fn set_wallpaper(
+        &mut self,
+        image: Option<Arc<RenderImage>>,
+        video: Option<crate::wallpaper::VideoPlayer>,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(old) = self.wallpaper_image.take() {
+            let _ = window.drop_image(old);
+        }
+        self.wallpaper_image = image;
+        self.wallpaper_video = video;
+        self.wallpaper_error = error.map(Into::into);
+        cx.notify();
+    }
+
+    /// Show the video's frames as they arrive; pause it while the window is hidden.
+    fn pump_wallpaper_video(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut wait = Duration::from_millis(15);
+            loop {
+                cx.background_executor().timer(wait).await;
+                let alive = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.wallpaper_generation != generation {
+                            return false;
+                        }
+                        let Some(video) = this.wallpaper_video.as_ref() else { return false };
+                        let visible = this.hwnd.is_some_and(win::is_window_visible);
+                        video.set_paused(!visible);
+                        wait = Duration::from_millis(if visible { 15 } else { 250 });
+                        let (w, h) = video.size;
+                        if let Some(img) = video.take_frame().and_then(|f| image::RgbaImage::from_raw(w, h, f)) {
+                            let frame = Arc::new(RenderImage::new(vec![image::Frame::new(img)]));
+                            if let Some(old) = this.wallpaper_image.replace(frame) {
+                                let _ = window.drop_image(old);
+                            }
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Pick a picture or video for the background.
+    pub fn pick_wallpaper(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择壁纸图片或视频".into()),
+        });
+        self.prompting = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = rx.await.ok().and_then(|r| r.ok()).flatten().and_then(|p| p.into_iter().next());
+            this.update_in(cx, |this, window, cx| {
+                this.prompting = false;
+                let Some(path) = picked else { return };
+                let path = path.display().to_string();
+                if crate::wallpaper::kind(&path).is_none() {
+                    this.show_toast("请选择图片（png / jpg / webp / bmp）或视频（mp4 / webm / mov / gif 等）", true, cx);
+                    return;
+                }
+                this.config.settings.wallpaper.path = path;
+                this.config.save();
+                this.reload_wallpaper(window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // -----------------------------------------------------------------------
@@ -1032,8 +1212,8 @@ impl Launcher {
         // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
         win::send_mask_key();
         if let Some(ring) = self.ring {
-            let logo = self.logo.clone();
-            if ring.update(cx, |ring, _, cx| ring.open(items, logo, cx)).is_ok() {
+            let (logo, bounce) = (self.logo.clone(), self.config.settings.ring_bounce);
+            if ring.update(cx, |ring, _, cx| ring.open(items, logo, bounce, cx)).is_ok() {
                 return;
             }
             self.ring = None;
@@ -1060,8 +1240,8 @@ impl Launcher {
         match cx.open_window(options, move |window, cx| cx.new(|_| crate::ring::Ring::new(launcher, window))) {
             Ok(handle) => {
                 self.ring = Some(handle);
-                let logo = self.logo.clone();
-                handle.update(cx, |ring, _, cx| ring.open(items, logo, cx)).ok();
+                let (logo, bounce) = (self.logo.clone(), self.config.settings.ring_bounce);
+                handle.update(cx, |ring, _, cx| ring.open(items, logo, bounce, cx)).ok();
             }
             Err(err) => self.show_toast(format!("无法显示圆环菜单：{err}"), true, cx),
         }
@@ -2259,6 +2439,15 @@ impl Launcher {
 
     pub fn on_drop_paths(&mut self, paths: &ExternalPaths, _window: &mut Window, cx: &mut Context<Self>) {
         let (mut tools, mut projects) = (0, 0);
+        // New tools land in the tab that is open: its category, or the ring.
+        let category = match &self.tool_filter {
+            ToolFilter::Category(c) => c.clone(),
+            _ => String::new(),
+        };
+        let mut ring_room = match self.tool_filter {
+            ToolFilter::Ring => crate::ring::MAX_ITEMS.saturating_sub(self.config.tools.iter().filter(|t| t.ring).count()),
+            _ => 0,
+        };
         for path in paths.paths() {
             if path.is_dir() {
                 self.config.touch_project(path);
@@ -2268,20 +2457,29 @@ impl Launcher {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let ring = ring_room > 0;
+                ring_room = ring_room.saturating_sub(1);
                 self.config.tools.push(Tool {
                     name,
                     target: path.display().to_string(),
                     color: "pink".into(),
+                    category: category.clone(),
+                    ring,
                     ..Default::default()
                 });
                 tools += 1;
             }
         }
         self.config.save();
+        let place = match &self.tool_filter {
+            ToolFilter::Category(c) => format!("到「{c}」"),
+            ToolFilter::Ring => "到圆环".to_string(),
+            _ => String::new(),
+        };
         let msg = match (tools, projects) {
             (0, p) => format!("已添加 {p} 个项目"),
-            (t, 0) => format!("已添加 {t} 个工具"),
-            (t, p) => format!("已添加 {t} 个工具和 {p} 个项目"),
+            (t, 0) => format!("已添加 {t} 个工具{place}"),
+            (t, p) => format!("已添加 {t} 个工具{place}和 {p} 个项目"),
         };
         self.show_toast(msg, false, cx);
     }
