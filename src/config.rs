@@ -271,6 +271,8 @@ pub struct Config {
     pub categories: Vec<String>,
     pub projects: Vec<Project>,
     pub history: Vec<HistoryEntry>,
+    /// Ids of favourite tools in the order shown (sorted separately from 全部工具).
+    pub favorite_order: Vec<String>,
 }
 
 impl Default for Config {
@@ -282,6 +284,7 @@ impl Default for Config {
             categories: default_categories(),
             projects: Vec::new(),
             history: Vec::new(),
+            favorite_order: Vec::new(),
         }
     }
 }
@@ -377,6 +380,15 @@ impl Config {
         if fs::write(&tmp, json).is_ok() {
             let _ = fs::rename(&tmp, Self::path());
         }
+    }
+
+    /// Favourite tools in their own order; ones missing from it follow in tool order.
+    pub fn favorites(&self) -> Vec<&Tool> {
+        let rank = |t: &Tool| self.favorite_order.iter().position(|id| *id == t.id).unwrap_or(usize::MAX);
+        let mut favorites: Vec<&Tool> = self.tools.iter().filter(|t| t.favorite).collect();
+        // Stable: equal ranks (unordered ones) keep the tool order.
+        favorites.sort_by_key(|t| rank(t));
+        favorites
     }
 
     pub fn record_launch(&mut self, key: &str, name: &str) {

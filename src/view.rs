@@ -14,6 +14,13 @@ use crate::{
     theme::Theme,
 };
 
+/// Which grid a tool tile is in (decides what dropping on it does).
+#[derive(Clone, Copy, PartialEq)]
+enum TileIn {
+    Grid,
+    Favorites,
+}
+
 /// What dropping a dragged tool on a tab does.
 #[derive(Clone)]
 enum TabDrop {
@@ -46,6 +53,9 @@ pub struct Metrics {
     pub recent_rows: usize,
     /// Height of exactly two rows of tool tiles; the grid scrolls beyond that.
     pub grid_h: f32,
+    /// Favourites as tiles (more than fit as cards): one or two rows, scrolling beyond.
+    pub fav_tiles: bool,
+    pub fav_grid_h: f32,
     pub bottom_min: f32,
     pub row_h: f32,
     pub action_h: f32,
@@ -53,14 +63,17 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn for_viewport(width: f32, height: f32) -> Self {
+    pub fn for_viewport(width: f32, height: f32, favorites: usize) -> Self {
         let mut m = Self::base(width, height);
+        m.fav_tiles = favorites > m.cols as usize;
+        let fav_rows = favorites.div_ceil(m.tile_cols as usize).clamp(1, 2) as f32;
+        m.fav_grid_h = fav_rows * m.tile_h + (fav_rows - 1.) * m.grid_gap;
         // Vertical budget: everything except the tile grid has a known height, so
         // give the grid as many whole rows as fit and the rest to the bottom panels.
         const HEADER: f32 = 22.;
         const TABS: f32 = 28.;
         let avail = height - m.titlebar - m.search_h - m.search_pb - 3. * m.section_gap;
-        let fav_block = HEADER + m.header_gap + m.fav_h;
+        let fav_block = HEADER + m.header_gap + if m.fav_tiles { m.fav_grid_h } else { m.fav_h };
         let tools_fixed = HEADER + TABS + 2. * m.header_gap;
         // Always two rows of tiles; the rest scrolls inside the grid.
         const ROWS: f32 = 2.;
@@ -102,6 +115,8 @@ impl Metrics {
             tile_icon: c(44., 38.),
             recent_rows: 0,
             grid_h: 0.,
+            fav_tiles: false,
+            fav_grid_h: 0.,
             bottom_min: c(206., 184.),
             row_h: c(36., 32.),
             action_h: c(34., 30.),
@@ -112,7 +127,7 @@ impl Metrics {
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::for_viewport(1040., 800.)
+        Self::for_viewport(1040., 800., 0)
     }
 }
 
@@ -500,23 +515,21 @@ impl Launcher {
 
     fn render_dashboard(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let m = self.metrics;
-        let favorites: Vec<_> = self
-            .config
-            .tools
-            .iter()
-            .filter(|t| t.favorite)
-            .cloned()
-            .collect();
+        let favorites: Vec<crate::config::Tool> = self.config.favorites().into_iter().cloned().collect();
 
-        // Favorite cards
+        // Favourites: big cards while they fit in one row, square tiles beyond that.
         let mut fav_cards = Vec::new();
-        let fav_total = favorites.len();
-        let fav_shown = if self.show_all_favorites {
-            fav_total
-        } else {
-            fav_total.min(m.cols as usize)
-        };
-        for (ix, tool) in favorites.iter().take(fav_shown).enumerate() {
+        let mut fav_tiles = Vec::new();
+        for (ix, tool) in favorites.iter().enumerate() {
+            if m.fav_tiles {
+                fav_tiles.push(self.tool_tile(ix, tool, TileIn::Favorites, theme, cx));
+                continue;
+            }
+            let dragged = DraggedTool {
+                id: tool.id.clone(),
+                name: tool.name.clone().into(),
+            };
+            let target = tool.id.clone();
             let visual = Self::tool_visual(tool);
             let tile = self.tile(&visual, m.fav_tile, m.fav_tile / 2., theme, cx);
             let (subtitle, progress) = self.tool_subtitle(tool);
@@ -537,6 +550,18 @@ impl Launcher {
                         this.activate(Target::Tool(id.clone()), false, window, cx)
                     }))
                     .on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(menu_target.clone(), cx))
+                    .on_drag(dragged, |dragged, _, _, cx| {
+                        cx.new(|_| DragPreview {
+                            name: dragged.name.clone(),
+                        })
+                    })
+                    .drag_over::<DraggedTool>(|s, _, _, cx| {
+                        let t = Theme::get(cx);
+                        s.bg(t.accent_soft).border_color(t.accent)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTool, _, cx| {
+                        this.drop_on_favorites(&dragged.id, Some(&target), cx)
+                    }))
                     .child(tile)
                     .child(
                         div()
@@ -575,38 +600,51 @@ impl Launcher {
             );
         }
 
+        let fav_total = favorites.len();
         let favorites_section = div()
+            .id("favorites")
             .flex()
             .flex_col()
             .gap(px(m.header_gap))
+            // Drop a tile anywhere here to make it a favourite (it goes last).
+            .on_drop(cx.listener(|this, dragged: &DraggedTool, _, cx| this.drop_on_favorites(&dragged.id, None, cx)))
             .child(
                 self.section_header("star-fill", rgb(0xf5b83d).into(), "收藏工具", theme)
-                    .when(fav_total > m.cols as usize, |d| {
-                        let label = if self.show_all_favorites {
-                            "收起".to_string()
-                        } else {
-                            format!("查看全部（{fav_total}）")
-                        };
-                        d.child(link("toggle-all-favorites", label, theme).on_click(cx.listener(
-                            |this, _: &ClickEvent, _, cx| {
-                                this.show_all_favorites = !this.show_all_favorites;
-                                cx.notify();
-                            },
-                        )))
+                    .when(fav_total > 0, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.text_faint)
+                                .mr(px(8.))
+                                .child(format!("{fav_total} 个 · 拖动可排序，从下方拖进来即可收藏")),
+                        )
                     })
                     .child(link("add-tool-top", "+ 添加工具", theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| this.open_tool_editor(None, None, window, cx),
                     ))),
             )
-            .child(if fav_cards.is_empty() {
+            .child(if m.fav_tiles {
+                div()
+                    .id("fav-grid")
+                    .h(px(m.fav_grid_h))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.fav_scroll)
+                    .child(div().grid().grid_cols(m.tile_cols).gap(px(m.grid_gap)).children(fav_tiles))
+                    .into_any_element()
+            } else if fav_cards.is_empty() {
                 panel(theme)
+                    .id("fav-empty")
+                    .drag_over::<DraggedTool>(|s, _, _, cx| {
+                        let t = Theme::get(cx);
+                        s.bg(t.accent_soft).border_color(t.accent).text_color(t.accent)
+                    })
                     .h(px(76.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(theme.text_muted)
                     .text_size(px(13.))
-                    .child("在工具卡片的 ⋯ 菜单中选择“收藏”，常用工具就会出现在这里")
+                    .child("把下方的工具拖到这里，或在 ⋯ 菜单中选择“收藏”")
                     .into_any_element()
             } else {
                 div()
@@ -644,6 +682,96 @@ impl Launcher {
             .child(bottom.flex_1().min_h(px(m.bottom_min)))
     }
 
+    /// A square tool tile (icon over name). Dropping another tile on it moves that
+    /// one into its spot: in 全部工具, or among the favourites.
+    fn tool_tile(&mut self, ix: usize, tool: &crate::config::Tool, place: TileIn, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics;
+        let visual = Self::tool_visual(tool);
+        let tile = self.tile(&visual, m.tile_icon, m.tile_icon / 2., theme, cx);
+        let (_, progress) = self.tool_subtitle(tool);
+        let pending = progress.is_none() && Self::needs_download(tool);
+        let id = tool.id.clone();
+        let target = tool.id.clone();
+        let menu_target = MenuTarget::Tool(tool.id.clone());
+        let (key, more_key) = match place {
+            TileIn::Grid => ("tool", "tool-more"),
+            TileIn::Favorites => ("fav-tile", "fav-tile-more"),
+        };
+        let group: SharedString = format!("{key}-{ix}").into();
+        let dragged = DraggedTool {
+            id: tool.id.clone(),
+            name: tool.name.clone().into(),
+        };
+        div()
+            .id((key, ix))
+            .group(group.clone())
+            .relative()
+            .h(px(m.tile_h))
+            .rounded(px(14.))
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .px(px(6.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.panel).border_color(theme.border))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.activate(Target::Tool(id.clone()), false, window, cx)
+            }))
+            .on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(menu_target.clone(), cx))
+            .on_drag(dragged, |dragged, _, _, cx| {
+                cx.new(|_| DragPreview {
+                    name: dragged.name.clone(),
+                })
+            })
+            // Drop another tile here to move it into this spot.
+            .drag_over::<DraggedTool>(|s, _, _, cx| {
+                let t = Theme::get(cx);
+                s.bg(t.accent_soft).border_color(t.accent)
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedTool, _, cx| match place {
+                TileIn::Grid => this.move_tool(&dragged.id, Some(&target), cx),
+                TileIn::Favorites => this.drop_on_favorites(&dragged.id, Some(&target), cx),
+            }))
+            .child(tile)
+            .child(
+                div().w_full().flex().justify_center().child(
+                    div()
+                        .max_w_full()
+                        .text_size(px(12.5))
+                        .truncate()
+                        .text_color(if progress.is_some() { theme.accent } else { theme.text })
+                        .child(match progress {
+                            Some(f) => format!("{:.0}%", f * 100.),
+                            None => tool.name.clone(),
+                        }),
+                ),
+            )
+            .when(pending, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(6.))
+                        .child(Self::download_pill(theme, false)),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .invisible()
+                    .group_hover(group, |s| s.visible())
+                    .child(self.more_button((more_key, ix), menu_target, theme, cx)),
+            )
+            .when_some(progress, |d, f| d.child(Self::progress_bar(f, theme)))
+            .into_any_element()
+    }
+
     fn render_tools_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let m = self.metrics;
         let tools = self.filtered_tools();
@@ -666,6 +794,10 @@ impl Launcher {
             let selected = current == filter;
             let menu = match &filter {
                 ToolFilter::Category(c) => Some(MenuTarget::Category(c.clone())),
+                _ => None,
+            };
+            let category = match &filter {
+                ToolFilter::Category(c) => Some(c.clone()),
                 _ => None,
             };
             let el = div()
@@ -692,6 +824,22 @@ impl Launcher {
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_filter(filter.clone(), cx)))
                 .when_some(menu, |d, menu| {
                     d.on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(menu, cx))
+                })
+                // User categories can be dragged into a new order.
+                .when_some(category.clone(), |d, name| {
+                    let target = name.clone();
+                    d.on_drag(DraggedCategory { name: name.into() }, |dragged, _, _, cx| {
+                        cx.new(|_| DragPreview {
+                            name: dragged.name.clone(),
+                        })
+                    })
+                    .drag_over::<DraggedCategory>(|s, _, _, cx| {
+                        let t = Theme::get(cx);
+                        s.border_color(t.accent).bg(t.accent_soft).text_color(t.accent)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedCategory, _, cx| {
+                        this.move_category(&dragged.name, &target, cx)
+                    }))
                 })
                 .when_some(drop, |d, drop| {
                     d.drag_over::<DraggedTool>(|s, _, _, cx| {
@@ -769,89 +917,7 @@ impl Launcher {
         // --- Square tiles --------------------------------------------------
         let mut tiles = Vec::new();
         for (ix, tool) in tools.iter().enumerate() {
-            let visual = Self::tool_visual(tool);
-            let tile = self.tile(&visual, m.tile_icon, m.tile_icon / 2., theme, cx);
-            let (_, progress) = self.tool_subtitle(tool);
-            let pending = progress.is_none() && Self::needs_download(tool);
-            let id = tool.id.clone();
-            let menu_target = MenuTarget::Tool(tool.id.clone());
-            let group: SharedString = format!("tile-{ix}").into();
-            let dragged = DraggedTool {
-                id: tool.id.clone(),
-                name: tool.name.clone().into(),
-            };
-            tiles.push(
-                div()
-                    .id(("tool", ix))
-                    .group(group.clone())
-                    .relative()
-                    .h(px(m.tile_h))
-                    .rounded(px(14.))
-                    .border_1()
-                    .border_color(gpui::transparent_black())
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .px(px(6.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.panel).border_color(theme.border))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.activate(Target::Tool(id.clone()), false, window, cx)
-                    }))
-                    .on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(menu_target.clone(), cx))
-                    .on_drag(dragged, |dragged, _, _, cx| {
-                        cx.new(|_| DragPreview {
-                            name: dragged.name.clone(),
-                        })
-                    })
-                    // Drop another tile here to move it into this spot.
-                    .drag_over::<DraggedTool>(|s, _, _, cx| {
-                        let t = Theme::get(cx);
-                        s.bg(t.accent_soft).border_color(t.accent)
-                    })
-                    .on_drop({
-                        let target = tool.id.clone();
-                        cx.listener(move |this, dragged: &DraggedTool, _, cx| {
-                            this.move_tool(&dragged.id, Some(&target), cx)
-                        })
-                    })
-                    .child(tile)
-                    .child(
-                        div().w_full().flex().justify_center().child(
-                            div()
-                                .max_w_full()
-                                .text_size(px(12.5))
-                                .truncate()
-                                .text_color(if progress.is_some() { theme.accent } else { theme.text })
-                                .child(match progress {
-                                    Some(f) => format!("{:.0}%", f * 100.),
-                                    None => tool.name.clone(),
-                                }),
-                        ),
-                    )
-                    .when(pending, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .top(px(6.))
-                                .left(px(6.))
-                                .child(Self::download_pill(theme, false)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(4.))
-                            .right(px(4.))
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .child(self.more_button(("tool-more", ix), menu_target, theme, cx)),
-                    )
-                    .when_some(progress, |d, f| d.child(Self::progress_bar(f, theme)))
-                    .into_any_element(),
-            );
+            tiles.push(self.tool_tile(ix, tool, TileIn::Grid, theme, cx));
         }
         let prefill_category = match &self.tool_filter {
             ToolFilter::Category(c) => c.clone(),
@@ -909,7 +975,7 @@ impl Launcher {
                             "把图标拖到“圆环”标签加入；没选时圆环显示最常用的 8 个"
                         }
                     } else {
-                        "拖动图标可调整顺序，拖到分类标签即可归类"
+                        "拖动图标或分类标签可调整顺序，图标拖到分类标签即可归类"
                     }),
             );
 
@@ -1765,7 +1831,8 @@ impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let viewport = window.viewport_size();
-        self.metrics = Metrics::for_viewport(viewport.width.into(), viewport.height.into());
+        let favorites = self.config.tools.iter().filter(|t| t.favorite).count();
+        self.metrics = Metrics::for_viewport(viewport.width.into(), viewport.height.into(), favorites);
         let searching = !self.search_text.trim().is_empty();
 
         let content = if self.mini {

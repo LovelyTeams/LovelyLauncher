@@ -1287,6 +1287,7 @@ impl Launcher {
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(div().text_size(px(13.5)).child(title))
@@ -1451,7 +1452,7 @@ impl Launcher {
                 toggle(
                     "alt-ring",
                     "按住 Alt 弹出圆环菜单",
-                    "单独按住 Alt 约 0.3 秒，屏幕右下角弹出工具圆环；在“全部工具 → 圆环”里挑选，不挑则显示最常用的 8 个",
+                    "单独按住 Alt 约 0.3 秒，屏幕右下角弹出工具圆环，工具在“全部工具 → 圆环”里挑选",
                     settings.alt_ring,
                     theme,
                 )
@@ -1468,7 +1469,7 @@ impl Launcher {
                     toggle(
                         "ring-fullscreen",
                         "全屏游戏、全屏视频时不弹出",
-                        "前台是全屏程序（包括无边框全屏的游戏）时，按住 Alt 不会弹出圆环，打游戏不会误触",
+                        "前台是全屏程序（含无边框全屏游戏）时不弹出，打游戏不会误触",
                         settings.ring_skip_fullscreen,
                         theme,
                     )

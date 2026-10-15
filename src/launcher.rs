@@ -281,6 +281,12 @@ pub struct DraggedTool {
     pub name: SharedString,
 }
 
+/// Payload while a category tab is being dragged to a new position.
+#[derive(Clone, Debug)]
+pub struct DraggedCategory {
+    pub name: SharedString,
+}
+
 /// Small floating label that follows the cursor during a drag.
 pub struct DragPreview {
     pub name: SharedString,
@@ -402,7 +408,8 @@ pub struct Launcher {
     full_rect: Option<win::WindowRect>,
     everything_generation: u64,
     pub(crate) tools_scroll: ScrollHandle,
-    pub(crate) show_all_favorites: bool,
+    /// Scrolls the favourites when they are shown as tiles.
+    pub(crate) fav_scroll: gpui::ScrollHandle,
     pub(crate) metrics: crate::view::Metrics,
     pub(crate) code_available: bool,
     /// Set while a native file dialog is open so hide-on-blur doesn't fire.
@@ -500,7 +507,7 @@ impl Launcher {
             full_rect: None,
             everything_generation: 0,
             tools_scroll: ScrollHandle::new(),
-            show_all_favorites: false,
+            fav_scroll: gpui::ScrollHandle::new(),
             metrics: Default::default(),
             code_available: false,
             prompting: false,
@@ -1981,12 +1988,41 @@ impl Launcher {
     }
 
     pub fn toggle_favorite(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) {
-            tool.favorite = !tool.favorite;
-            let msg = if tool.favorite { "已加入收藏" } else { "已取消收藏" };
-            self.config.save();
-            self.show_toast(msg, false, cx);
+        let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) else { return };
+        tool.favorite = !tool.favorite;
+        let now = tool.favorite;
+        let order = &mut self.config.favorite_order;
+        order.retain(|f| f != id);
+        if now {
+            order.push(id.to_string());
         }
+        self.config.save();
+        self.show_toast(if now { "已加入收藏" } else { "已取消收藏" }, false, cx);
+    }
+
+    /// A tile was dropped on the favourites: on `target` (it takes that spot) or on
+    /// the section itself (it goes last). Tools that weren't favourites become ones.
+    pub fn drop_on_favorites(&mut self, id: &str, target: Option<&str>, cx: &mut Context<Self>) {
+        let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) else { return };
+        let added = !tool.favorite;
+        tool.favorite = true;
+        let name = tool.name.clone();
+        let mut order: Vec<String> = self.config.favorites().iter().map(|t| t.id.clone()).collect();
+        let from = order.iter().position(|f| f == id);
+        let to = target.and_then(|t| order.iter().position(|f| f == t));
+        if let Some(from) = from {
+            order.remove(from);
+        }
+        match to {
+            Some(to) => order.insert(to.min(order.len()), id.to_string()),
+            None => order.push(id.to_string()),
+        }
+        self.config.favorite_order = order;
+        self.config.save();
+        if added {
+            self.show_toast(format!("已收藏“{name}”"), false, cx);
+        }
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -2143,6 +2179,24 @@ impl Launcher {
         }
         let tool = tools.remove(from);
         tools.insert(to, tool);
+        self.config.save();
+        cx.notify();
+    }
+
+    /// Drag-and-drop reordering of category tabs: `name` takes the place of `target`.
+    pub fn move_category(&mut self, name: &str, target: &str, cx: &mut Context<Self>) {
+        let categories = &mut self.config.categories;
+        let (Some(from), Some(to)) = (
+            categories.iter().position(|c| c == name),
+            categories.iter().position(|c| c == target),
+        ) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let category = categories.remove(from);
+        categories.insert(to, category);
         self.config.save();
         cx.notify();
     }
