@@ -304,6 +304,11 @@ impl Ring {
     }
 }
 
+/// `el` (a `size`-px square) absolutely positioned with its centre on (`x`, `y`).
+fn place(el: AnyElement, x: f32, y: f32, size: f32) -> AnyElement {
+    div().absolute().left(px(x - size / 2.)).top(px(y - size / 2.)).size(px(size)).child(el).into_any_element()
+}
+
 /// An absolutely positioned circle centred on (`x`, `y`) with radii `rx` x `ry`.
 fn disc(x: f32, y: f32, rx: f32, ry: f32) -> gpui::Div {
     div()
@@ -420,48 +425,41 @@ impl Render for Ring {
         );
         // Gloss across the top of the bubble.
         layers.push(disc(c, c - ry * 0.62, rx * 0.46, ry * 0.12).bg(mix(top, hsla(0., 0., 1., 1.), 0.85)).into_any_element());
-        if s > 0.55 {
-            let pop = self.centre_pop.x.max(0.);
+        // The picture grows and pops with the ring; the text keeps a fixed size and
+        // place (scaling it every frame made it shimmer) and just fades in and out.
+        let pop = self.centre_pop.x.max(0.);
+        let selected = self.selected.and_then(|i| self.items.get(i)).map(|item| (item.visual.clone(), item.name.clone()));
+        let (picture, title, note): (Option<AnyElement>, SharedString, SharedString) = match selected {
+            Some((visual, name)) => {
+                let size = 62. * s * pop;
+                let tile = self.tile(&visual, size, &theme, cx).map(|t| place(t, c, c - 20., size));
+                (tile, name, "松开 Alt 打开".into())
+            }
+            None => {
+                let size = 76. * s * pop;
+                let logo = self.logo.clone().map(|logo| place(img(logo).size(px(size)).into_any_element(), c, c - 14., size));
+                let (title, note) = if self.items.is_empty() {
+                    ("还没有工具", "先在主界面添加工具")
+                } else {
+                    ("", "指向图标 · 松开 Alt")
+                };
+                (logo, title.into(), note.into())
+            }
+        };
+        layers.extend(picture);
+        let fade = ((s - 0.8) / 0.2).clamp(0., 1.);
+        if fade > 0. {
             let hint = hsla(accent.h, accent.s * 0.7, if theme.dark { 0.72 } else { 0.42 }, 1.);
-            let selected = self.selected.and_then(|i| self.items.get(i)).map(|item| (item.visual.clone(), item.name.clone()));
-            let (picture, title, note): (Option<AnyElement>, SharedString, SharedString) = match selected {
-                Some((visual, name)) => (self.tile(&visual, 46. * s * pop, &theme, cx), name, "松开 Alt 打开".into()),
-                None => {
-                    let logo = self.logo.clone().map(|logo| img(logo).size(px(58. * s * pop)).rounded_full().into_any_element());
-                    if self.items.is_empty() {
-                        (logo, "还没有工具".into(), "先在主界面添加工具".into())
-                    } else {
-                        (logo, SharedString::default(), "指向图标 · 松开 Alt".into())
-                    }
-                }
-            };
-            let content = div()
-                .absolute()
-                .left(px(c - rx))
-                .top(px(c - ry))
-                .w(px(rx * 2.))
-                .h(px(ry * 2.))
-                .px(px(16. * s))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(5. * s))
-                .children(picture)
-                .when(!title.is_empty(), |d| {
-                    d.child(
-                        div()
-                            .max_w_full()
-                            .text_center()
-                            .truncate()
-                            .text_size(px(14. * s))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(title),
-                    )
-                })
-                .child(div().text_center().text_size(px(10.5 * s)).text_color(hint).child(note));
-            layers.push(content.into_any_element());
+            let line = |top: f32, height: f32| div().absolute().left(px(c - 72.)).top(px(top)).w(px(144.)).h(px(height)).flex().justify_center().opacity(fade);
+            let (title_y, note_y) = if title.is_empty() { (0., c + 36.) } else { (c + 18., c + 40.) };
+            if !title.is_empty() {
+                layers.push(
+                    line(title_y, 20.)
+                        .child(div().max_w_full().truncate().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text).child(title))
+                        .into_any_element(),
+                );
+            }
+            layers.push(line(note_y, 16.).child(div().text_size(px(10.5)).text_color(hint).child(note)).into_any_element());
         }
 
         // Icons around the band.
