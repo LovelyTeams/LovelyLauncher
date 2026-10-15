@@ -1,4 +1,5 @@
-//! Hold Alt: a springy ring of favourite tools pops up in the bottom-right corner.
+//! Hold Alt: a springy ring of favourite tools pops up in the bottom-right corner
+//! (or around the mouse pointer).
 //! Point at an icon and let go of Alt (or click it) to open it.
 //!
 //! Everything moves on damped springs, stepped once per frame: the glassy ring pops
@@ -186,7 +187,7 @@ impl Ring {
     }
 
     /// Pop the ring up in the corner of the monitor under the cursor.
-    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, bounce: u8, cx: &mut Context<Self>) {
+    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, bounce: u8, at_cursor: bool, cx: &mut Context<Self>) {
         let b = Bounce::level(bounce);
         self.bounce = b;
         let now = Instant::now();
@@ -207,7 +208,7 @@ impl Ring {
         self.pull_y = Spring::new(0., 300., 18.);
         if let Some(raw) = self.hwnd {
             // Not synchronously: moving the window re-enters GPUI.
-            cx.spawn(async move |_, _| win::place_corner_popup(raw, SIZE, MARGIN)).detach();
+            cx.spawn(async move |_, _| win::place_corner_popup(raw, SIZE, MARGIN, at_cursor)).detach();
         }
         cx.notify();
     }

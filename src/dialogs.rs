@@ -1890,7 +1890,7 @@ impl Launcher {
                 toggle(
                     "alt-ring",
                     "按住 Alt 弹出圆环菜单",
-                    "单独按住 Alt 约 0.3 秒，屏幕右下角弹出工具圆环，工具在“全部工具 → 圆环”里挑选",
+                    "单独按住 Alt 约 0.3 秒弹出工具圆环，工具在“全部工具 → 圆环”里挑选",
                     settings.alt_ring,
                     theme,
                 )
@@ -1914,6 +1914,20 @@ impl Launcher {
                         .into_any_element()
                 });
                 d.child(choice_row("圆环弹性", "弹出、晃动和黏液拉伸的幅度", options.collect(), theme))
+                .child(
+                    toggle(
+                        "ring-at-cursor",
+                        "圆环跟随鼠标位置",
+                        "在鼠标所在的位置弹出，靠近屏幕边缘时自动往里挪；关闭时固定在屏幕右下角",
+                        settings.ring_at_cursor,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.ring_at_cursor = !this.config.settings.ring_at_cursor;
+                        this.config.save();
+                        cx.notify();
+                    })),
+                )
                 .child(
                     toggle(
                         "ring-fullscreen",

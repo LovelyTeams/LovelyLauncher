@@ -241,7 +241,9 @@ pub fn remove_window_frame(raw: isize) {
 
 /// Show a borderless popup without activating it, above everything: `size` logical
 /// pixels square, in the bottom-right corner of the work area under the cursor.
-pub fn place_corner_popup(raw: isize, size: f32, margin: f32) {
+/// Put the square popup in the bottom-right corner of the mouse's monitor, or
+/// (`at_cursor`) centred on the mouse, kept inside that monitor's work area.
+pub fn place_corner_popup(raw: isize, size: f32, margin: f32, at_cursor: bool) {
     use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
     remove_window_frame(raw);
     let h = hwnd(raw);
@@ -262,7 +264,13 @@ pub fn place_corner_popup(raw: isize, size: f32, margin: f32) {
         let side = (size * scale) as i32;
         let gap = (margin * scale) as i32;
         let work = info.rcWork;
-        let (x, y) = (work.right - side - gap, work.bottom - side - gap);
+        let (x, y) = if at_cursor {
+            // Near an edge the ring moves inwards rather than being cut off.
+            let clamp = |v: i32, lo: i32, hi: i32| v.min(hi - side).max(lo);
+            (clamp(cursor.x - side / 2, work.left, work.right), clamp(cursor.y - side / 2, work.top, work.bottom))
+        } else {
+            (work.right - side - gap, work.bottom - side - gap)
+        };
         let _ = SetWindowPos(h, Some(HWND_TOPMOST), x, y, side, side, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }

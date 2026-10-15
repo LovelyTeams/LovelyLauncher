@@ -143,6 +143,8 @@ pub struct Settings {
     pub ring_excluded: Vec<String>,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
+    /// Pop the ring up around the mouse pointer instead of in the bottom-right corner.
+    pub ring_at_cursor: bool,
     /// A picture or video behind the main window.
     pub wallpaper: Wallpaper,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
@@ -296,6 +298,7 @@ impl Default for Settings {
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
             ring_bounce: 2,
+            ring_at_cursor: false,
             wallpaper: Wallpaper::default(),
             ffmpeg_path: String::new(),
         }

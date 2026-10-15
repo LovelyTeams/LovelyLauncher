@@ -1237,8 +1237,9 @@ impl Launcher {
         // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
         win::send_mask_key();
         if let Some(ring) = self.ring {
-            let (logo, bounce) = (self.logo.clone(), self.config.settings.ring_bounce);
-            if ring.update(cx, |ring, _, cx| ring.open(items, logo, bounce, cx)).is_ok() {
+            let (logo, bounce, at_cursor) =
+                (self.logo.clone(), self.config.settings.ring_bounce, self.config.settings.ring_at_cursor);
+            if ring.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, cx)).is_ok() {
                 return;
             }
             self.ring = None;
@@ -1265,8 +1266,9 @@ impl Launcher {
         match cx.open_window(options, move |window, cx| cx.new(|_| crate::ring::Ring::new(launcher, window))) {
             Ok(handle) => {
                 self.ring = Some(handle);
-                let (logo, bounce) = (self.logo.clone(), self.config.settings.ring_bounce);
-                handle.update(cx, |ring, _, cx| ring.open(items, logo, bounce, cx)).ok();
+                let (logo, bounce, at_cursor) =
+                (self.logo.clone(), self.config.settings.ring_bounce, self.config.settings.ring_at_cursor);
+                handle.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, cx)).ok();
             }
             Err(err) => self.show_toast(format!("无法显示圆环菜单：{err}"), true, cx),
         }
