@@ -15,6 +15,7 @@ mod launcher;
 mod markdown;
 mod preview;
 mod ring;
+mod scan;
 mod search;
 mod system;
 mod theme;

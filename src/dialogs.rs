@@ -21,6 +21,21 @@ pub enum Dialog {
     Tool(ToolEditor),
     Settings(SettingsEditor),
     Category(CategoryEditor),
+    Scan(ScanResults),
+}
+
+/// What 快速扫码 found.
+pub struct ScanResults {
+    codes: Vec<crate::scan::Code>,
+    /// Which result was last copied.
+    copied: Option<usize>,
+    focus: FocusHandle,
+}
+
+impl ScanResults {
+    pub fn new(codes: Vec<crate::scan::Code>, copied: Option<usize>, focus: FocusHandle) -> Self {
+        Self { codes, copied, focus }
+    }
 }
 
 pub struct CategoryEditor {
@@ -44,6 +59,8 @@ pub struct ToolEditor {
     icon_path: String,
     color: String,
     favorite: bool,
+    /// Kept as is: the ring is managed from the "圆环" tab and the tool menu.
+    ring: bool,
     error: Option<SharedString>,
     focus: FocusHandle,
 }
@@ -93,6 +110,8 @@ pub struct SettingsEditor {
     _accent_subscription: Subscription,
     status: Option<(SharedString, bool)>,
     detected_terminal: String,
+    /// Programs with a window open when Settings was opened (quick picks for exclusions).
+    running: Vec<String>,
     focus: FocusHandle,
 }
 
@@ -116,6 +135,7 @@ impl Dialog {
                 SettingsTab::Search => vec![s.search_url.clone()],
             },
             Dialog::Category(c) => vec![c.name.clone()],
+            Dialog::Scan(_) => Vec::new(),
         }
     }
 
@@ -124,6 +144,7 @@ impl Dialog {
             Dialog::Tool(e) => &e.focus,
             Dialog::Settings(s) => &s.focus,
             Dialog::Category(c) => &c.focus,
+            Dialog::Scan(s) => &s.focus,
         }
     }
 }
@@ -245,6 +266,7 @@ impl Launcher {
             icon_path: tool.icon_path.clone(),
             color: tool.color.clone(),
             favorite: tool.favorite,
+            ring: tool.ring,
             error: None,
             focus: cx.focus_handle(),
         };
@@ -295,6 +317,7 @@ impl Launcher {
             _accent_subscription: accent_subscription,
             status: None,
             detected_terminal: win::detect_terminal(),
+            running: win::windowed_programs(),
             focus: cx.focus_handle(),
         };
         let focus = editor.focus.clone();
@@ -357,6 +380,7 @@ impl Launcher {
             Some(Dialog::Tool(_)) => self.save_tool(window, cx),
             Some(Dialog::Settings(_)) => self.save_settings(window, cx),
             Some(Dialog::Category(_)) => self.save_category(window, cx),
+            Some(Dialog::Scan(_)) => self.close_dialog(window, cx),
             None => {}
         }
     }
@@ -384,6 +408,7 @@ impl Launcher {
             icon_path: editor.icon_path.clone(),
             color: editor.color.clone(),
             favorite: editor.favorite,
+            ring: editor.ring,
             download_url: read(&editor.download_url, cx),
             category: read(&editor.category, cx),
         };
@@ -623,7 +648,7 @@ impl Launcher {
                 let visual = Self::tool_visual(&draft);
                 Some(self.tile(&visual, 56., 28., theme, cx))
             }
-            Dialog::Settings(_) | Dialog::Category(_) => None,
+            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) => None,
         };
         let dialog = self.dialog.as_ref()?;
         let focus = dialog.focus_handle().clone();
@@ -662,6 +687,24 @@ impl Launcher {
                     )))
                     .child(button("category-save", "保存", true, theme).on_click(cx.listener(
                         |this, _: &ClickEvent, window, cx| this.save_category(window, cx),
+                    )))
+                    .into_any_element(),
+            ),
+            Dialog::Scan(results) => (
+                if results.codes.is_empty() { "快速扫码" } else { "扫码结果" },
+                self.render_scan_results(results, theme, cx),
+                div()
+                    .flex_none()
+                    .px(px(22.))
+                    .py(px(16.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(10.))
+                    .child(button("scan-again", "重新扫描", false, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.start_scan(window, cx),
+                    )))
+                    .child(button("scan-done", "完成", true, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.close_dialog(window, cx),
                     )))
                     .into_any_element(),
             ),
@@ -973,6 +1016,177 @@ impl Launcher {
             .into_any_element()
     }
 
+    fn render_scan_results(&self, results: &ScanResults, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if results.codes.is_empty() {
+            return div()
+                .py(px(28.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .child(icon("qr", 32., theme.text_faint))
+                .child(div().text_size(px(14.)).child("屏幕上和剪贴板里都没有找到二维码或条形码"))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.text_faint)
+                        .child("把码完整地显示在屏幕上（别太小），或者复制二维码图片后再试"),
+                )
+                .into_any_element();
+        }
+        let rows = results.codes.iter().enumerate().map(|(ix, code)| {
+            let copied = results.copied == Some(ix);
+            let text = code.text.clone();
+            let link = code.is_link().then(|| code.text.trim().to_string());
+            let small_button = |id: (&'static str, usize), label: String, icon_name: &'static str, on: bool| {
+                div()
+                    .id(id)
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(12.5))
+                    .cursor_pointer()
+                    .when(on, |d| d.border_color(theme.accent).bg(theme.accent_soft).text_color(theme.accent))
+                    .when(!on, |d| d.border_color(theme.border).bg(theme.panel).hover(|s| s.border_color(theme.accent)))
+                    .child(icon(icon_name, 13., if on { theme.accent } else { theme.text_muted }))
+                    .child(label)
+            };
+            div()
+                .p(px(12.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.panel)
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded_full()
+                                .bg(theme.accent_soft)
+                                .text_color(theme.accent)
+                                .text_size(px(11.5))
+                                .child(code.kind.clone()),
+                        )
+                        .child(div().flex_1())
+                        .when_some(link, |d, url| {
+                            d.child(small_button(("scan-open", ix), "打开链接".into(), "external", false).on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| {
+                                    this.spawn_launch(url.clone(), String::new(), String::new(), false, cx)
+                                },
+                            )))
+                        })
+                        .child(
+                            small_button(("scan-copy", ix), if copied { "已复制" } else { "复制" }.into(), if copied { "check" } else { "copy" }, copied)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                                    if let Some(Dialog::Scan(results)) = this.dialog.as_mut() {
+                                        results.copied = Some(ix);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(div().text_size(px(13.5)).line_height(px(20.)).child(code.text.clone()))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .pb(px(6.))
+            .child(div().text_size(px(12.5)).text_color(theme.text_faint).child(match results.copied {
+                Some(_) if results.codes.len() == 1 => "找到 1 个码，内容已复制到剪贴板".to_string(),
+                _ => format!("找到 {} 个码", results.codes.len()),
+            }))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// Programs that never get the Alt ring: chips to remove, plus quick picks from
+    /// what's running and a file picker.
+    fn render_ring_exclusions(&self, editor: &SettingsEditor, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let excluded = &self.config.settings.ring_excluded;
+        let chip = |id: (&'static str, usize), text: String, icon_name: &'static str, accent: bool| {
+            div()
+                .id(id)
+                .h(px(26.))
+                .px(px(10.))
+                .rounded_full()
+                .border_1()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .when(accent, |d| d.border_color(theme.accent).text_color(theme.accent).bg(theme.accent_soft))
+                .when(!accent, |d| {
+                    d.border_color(theme.border).text_color(theme.text).bg(theme.panel).hover(|s| s.border_color(theme.accent))
+                })
+                .child(text)
+                .child(icon(icon_name, 12., if accent { theme.accent } else { theme.text_faint }))
+        };
+        let mut current = Vec::new();
+        for (ix, name) in excluded.iter().enumerate() {
+            let name_owned = name.clone();
+            current.push(
+                chip(("ring-excluded", ix), name.clone(), "x", false)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.remove_ring_exclusion(&name_owned, cx)))
+                    .into_any_element(),
+            );
+        }
+        current.push(
+            chip(("ring-exclude-pick", 0), "选择程序…".into(), "plus", true)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_ring_exclusion(cx)))
+                .into_any_element(),
+        );
+        let suggestions: Vec<AnyElement> = editor
+            .running
+            .iter()
+            .filter(|n| !excluded.iter().any(|e| e.eq_ignore_ascii_case(n)))
+            .take(12)
+            .enumerate()
+            .map(|(ix, name)| {
+                let name_owned = name.clone();
+                chip(("ring-exclude-running", ix), name.clone(), "plus", false)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.add_ring_exclusion(&name_owned, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_size(px(13.5)).child("排除的程序"))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_faint)
+                            .child("这些程序在前台时，按住 Alt 不会弹出圆环（比如窗口模式运行的游戏）"),
+                    ),
+            )
+            .child(div().flex().flex_wrap().gap(px(6.)).children(current))
+            .when(!suggestions.is_empty(), |d| {
+                d.child(div().text_size(px(12.)).text_color(theme.text_faint).child("正在运行，点一下即可排除："))
+                    .child(div().flex().flex_wrap().gap(px(6.)).children(suggestions))
+            })
+            .into_any_element()
+    }
+
     fn render_settings_form(&self, editor: &SettingsEditor, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let settings = &self.config.settings;
         let section = |title: &'static str| {
@@ -1237,7 +1451,7 @@ impl Launcher {
                 toggle(
                     "alt-ring",
                     "按住 Alt 弹出圆环菜单",
-                    "单独按住 Alt 约 0.3 秒，屏幕右下角会弹出常用工具的圆环（收藏的排在前面）；指向图标松开 Alt 即可打开",
+                    "单独按住 Alt 约 0.3 秒，屏幕右下角弹出工具圆环；在“全部工具 → 圆环”里挑选，不挑则显示最常用的 8 个",
                     settings.alt_ring,
                     theme,
                 )
@@ -1264,6 +1478,7 @@ impl Launcher {
                         cx.notify();
                     })),
                 )
+                .child(self.render_ring_exclusions(editor, theme, cx))
             })
             .child(
                 toggle(

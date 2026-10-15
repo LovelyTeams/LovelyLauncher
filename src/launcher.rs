@@ -37,6 +37,7 @@ actions!(
         NewTerminal,
         OpenProject,
         TakeScreenshot,
+        ScanCode,
         QuickNote,
         OpenSettings,
         AddTool,
@@ -58,6 +59,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-t", NewTerminal, launcher),
         KeyBinding::new("ctrl-o", OpenProject, launcher),
         KeyBinding::new("ctrl-shift-s", TakeScreenshot, launcher),
+        KeyBinding::new("ctrl-shift-q", ScanCode, launcher),
         KeyBinding::new("ctrl-n", QuickNote, launcher),
         KeyBinding::new("ctrl-,", OpenSettings, launcher),
         KeyBinding::new("ctrl-d", AddTool, launcher),
@@ -73,14 +75,16 @@ pub enum QuickAction {
     NewTerminal,
     OpenProject,
     Screenshot,
+    Scan,
     Note,
 }
 
 impl QuickAction {
-    pub const ALL: [QuickAction; 4] = [
+    pub const ALL: [QuickAction; 5] = [
         QuickAction::NewTerminal,
         QuickAction::OpenProject,
         QuickAction::Screenshot,
+        QuickAction::Scan,
         QuickAction::Note,
     ];
 
@@ -89,6 +93,7 @@ impl QuickAction {
             QuickAction::NewTerminal => "新建终端",
             QuickAction::OpenProject => "打开项目",
             QuickAction::Screenshot => "截图",
+            QuickAction::Scan => "快速扫码",
             QuickAction::Note => "快速笔记",
         }
     }
@@ -98,6 +103,7 @@ impl QuickAction {
             QuickAction::NewTerminal => "terminal",
             QuickAction::OpenProject => "folder-open",
             QuickAction::Screenshot => "scan",
+            QuickAction::Scan => "qr",
             QuickAction::Note => "note",
         }
     }
@@ -107,6 +113,7 @@ impl QuickAction {
             QuickAction::NewTerminal => &["Ctrl", "T"],
             QuickAction::OpenProject => &["Ctrl", "O"],
             QuickAction::Screenshot => &["Ctrl", "Shift", "S"],
+            QuickAction::Scan => &["Ctrl", "Shift", "Q"],
             QuickAction::Note => &["Ctrl", "N"],
         }
     }
@@ -116,12 +123,71 @@ impl QuickAction {
             QuickAction::NewTerminal => "action:terminal",
             QuickAction::OpenProject => "action:project",
             QuickAction::Screenshot => "action:screenshot",
+            QuickAction::Scan => "action:scan",
             QuickAction::Note => "action:note",
         }
     }
 
     fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.key() == key)
+    }
+}
+
+/// Tools for the Alt ring: the ones picked in the "圆环" tab; with none picked, the
+/// most launched ones, topped up with favourites and then the rest.
+fn pick_ring_tools<'a>(tools: &'a [Tool], history: &[crate::config::HistoryEntry], max: usize) -> Vec<&'a Tool> {
+    let chosen: Vec<&Tool> = tools.iter().filter(|t| t.ring).take(max).collect();
+    if !chosen.is_empty() {
+        return chosen;
+    }
+    let mut used: Vec<(&Tool, u32)> = history
+        .iter()
+        .filter_map(|h| Some((tools.iter().find(|t| Some(t.id.as_str()) == h.key.strip_prefix("tool:"))?, h.count)))
+        .collect();
+    // Most launched first; ties keep the history's most-recent-first order.
+    used.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut picked: Vec<&Tool> = Vec::new();
+    let favourites = tools.iter().filter(|t| t.favorite);
+    for tool in used.into_iter().map(|(t, _)| t).chain(favourites).chain(tools.iter()) {
+        if picked.len() >= max {
+            break;
+        }
+        if !picked.iter().any(|p| p.id == tool.id) {
+            picked.push(tool);
+        }
+    }
+    picked
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+    use crate::config::HistoryEntry;
+
+    fn tool(id: &str, favorite: bool, ring: bool) -> Tool {
+        Tool { id: id.into(), name: id.into(), favorite, ring, ..Default::default() }
+    }
+
+    fn used(id: &str, count: u32) -> HistoryEntry {
+        HistoryEntry { key: format!("tool:{id}"), name: id.into(), last_used: 0, count }
+    }
+
+    fn ids(tools: Vec<&Tool>) -> Vec<&str> {
+        tools.into_iter().map(|t| t.id.as_str()).collect()
+    }
+
+    #[test]
+    fn picked_tools_win() {
+        let tools = [tool("a", true, false), tool("b", false, true), tool("c", false, true)];
+        assert_eq!(ids(pick_ring_tools(&tools, &[used("a", 9)], 8)), ["b", "c"]);
+    }
+
+    #[test]
+    fn otherwise_most_used_then_favourites_then_rest() {
+        let tools = [tool("a", false, false), tool("b", true, false), tool("c", false, false), tool("d", false, false)];
+        let history = [used("c", 2), used("d", 7), used("gone", 50)];
+        assert_eq!(ids(pick_ring_tools(&tools, &history, 3)), ["d", "c", "b"]);
+        assert_eq!(ids(pick_ring_tools(&tools, &history, 8)), ["d", "c", "b", "a"]);
     }
 }
 
@@ -202,6 +268,8 @@ pub struct RecentItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolFilter {
     All,
+    /// Tools picked for the Alt ring.
+    Ring,
     Uncategorized,
     Category(String),
 }
@@ -927,26 +995,8 @@ impl Launcher {
         }
     }
 
-    /// Tools for the Alt ring: favourites first, then recently used, then the rest.
     fn ring_tools(&self) -> Vec<&crate::config::Tool> {
-        let tools = &self.config.tools;
-        let mut picked: Vec<&crate::config::Tool> = tools.iter().filter(|t| t.favorite).collect();
-        let recent = self
-            .config
-            .history
-            .iter()
-            .filter_map(|h| h.key.strip_prefix("tool:"))
-            .filter_map(|id| tools.iter().find(|t| t.id == id));
-        for tool in recent.chain(tools.iter()) {
-            if picked.len() >= crate::ring::MAX_ITEMS {
-                break;
-            }
-            if !picked.iter().any(|p| p.id == tool.id) {
-                picked.push(tool);
-            }
-        }
-        picked.truncate(crate::ring::MAX_ITEMS);
-        picked
+        pick_ring_tools(&self.config.tools, &self.config.history, crate::ring::MAX_ITEMS)
     }
 
     /// Alt has been held on its own long enough: pop up the ring of tools.
@@ -954,6 +1004,14 @@ impl Launcher {
         // Holding Alt is often part of playing a game: stay out of the way.
         if self.config.settings.ring_skip_fullscreen && win::fullscreen_app_in_front() {
             return;
+        }
+        let excluded = &self.config.settings.ring_excluded;
+        if !excluded.is_empty() {
+            if let Some(program) = win::foreground_program() {
+                if excluded.iter().any(|e| e.eq_ignore_ascii_case(&program)) {
+                    return;
+                }
+            }
         }
         let items: Vec<crate::ring::RingItem> = self
             .ring_tools()
@@ -1105,6 +1163,54 @@ impl Launcher {
     }
 
     /// Let the user pick an existing ffmpeg.exe.
+    pub fn add_ring_exclusion(&mut self, program: &str, cx: &mut Context<Self>) {
+        let program = program.trim().to_lowercase();
+        let list = &mut self.config.settings.ring_excluded;
+        if program.is_empty() || list.iter().any(|e| e.eq_ignore_ascii_case(&program)) {
+            return;
+        }
+        list.push(program);
+        self.config.save();
+        cx.notify();
+    }
+
+    pub fn remove_ring_exclusion(&mut self, program: &str, cx: &mut Context<Self>) {
+        self.config.settings.ring_excluded.retain(|e| !e.eq_ignore_ascii_case(program));
+        self.config.save();
+        cx.notify();
+    }
+
+    /// Pick one or more .exe files to exclude from the Alt ring.
+    pub fn pick_ring_exclusion(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择不弹出圆环的程序".into()),
+        });
+        self.prompting = true;
+        cx.spawn(async move |this, cx| {
+            let picked = rx.await.ok().and_then(|r| r.ok()).flatten().unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.prompting = false;
+                let mut skipped = false;
+                for path in picked {
+                    let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+                    match path.file_name() {
+                        Some(name) if is_exe => this.add_ring_exclusion(&name.to_string_lossy(), cx),
+                        _ => skipped = true,
+                    }
+                }
+                if skipped {
+                    this.show_toast("只能选择 .exe 程序", true, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn choose_ffmpeg(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1734,6 +1840,10 @@ impl Launcher {
                 self.spawn_launch("ms-screenclip:".into(), String::new(), String::new(), false, cx);
                 false
             }
+            QuickAction::Scan => {
+                self.start_scan(window, cx);
+                false
+            }
             QuickAction::Note => {
                 let path = Config::dir().join("notes.md");
                 if !path.exists() {
@@ -1744,6 +1854,34 @@ impl Launcher {
                 true
             }
         }
+    }
+
+    /// 快速扫码: step aside, read the screens and the clipboard, then show what was found.
+    pub fn start_scan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = None;
+        self.hide(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            // Let the window disappear before the screen is read.
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            let codes = cx.background_spawn(async { crate::scan::scan_all() }).await;
+            this.update_in(cx, |this, window, cx| this.show_scan_results(codes, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn show_scan_results(&mut self, codes: Vec<crate::scan::Code>, window: &mut Window, cx: &mut Context<Self>) {
+        // Dialogs need the full window.
+        self.restore_full(cx);
+        // A single result is what was wanted almost every time: copy it straight away.
+        let copied = (codes.len() == 1).then(|| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(codes[0].text.clone()));
+            0
+        });
+        let focus = cx.focus_handle();
+        self.dialog = Some(crate::dialogs::Dialog::Scan(crate::dialogs::ScanResults::new(codes, copied, focus.clone())));
+        self.show(window, cx);
+        window.focus(&focus);
+        cx.notify();
     }
 
     pub fn prompt_open_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1810,6 +1948,37 @@ impl Launcher {
 
     // -----------------------------------------------------------------------
     // Mutations
+
+    /// Put a tool on the Alt ring, or take it off.
+    pub fn toggle_ring(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.config.tools.iter().find(|t| t.id == id) {
+            Some(tool) if tool.ring => {
+                if let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) {
+                    tool.ring = false;
+                }
+                self.config.save();
+                self.show_toast("已移出圆环", false, cx);
+            }
+            Some(_) => self.add_to_ring(id, cx),
+            None => {}
+        }
+    }
+
+    pub fn add_to_ring(&mut self, id: &str, cx: &mut Context<Self>) {
+        let count = self.config.tools.iter().filter(|t| t.ring).count();
+        let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) else { return };
+        if tool.ring {
+            return;
+        }
+        if count >= crate::ring::MAX_ITEMS {
+            self.show_toast(format!("圆环最多放 {} 个工具，先移出一个吧", crate::ring::MAX_ITEMS), true, cx);
+            return;
+        }
+        tool.ring = true;
+        let name = tool.name.clone();
+        self.config.save();
+        self.show_toast(format!("已将“{name}”加入圆环"), false, cx);
+    }
 
     pub fn toggle_favorite(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) {
@@ -1929,6 +2098,7 @@ impl Launcher {
             .iter()
             .filter(|t| match &self.tool_filter {
                 ToolFilter::All => true,
+                ToolFilter::Ring => t.ring,
                 ToolFilter::Uncategorized => t.category.is_empty() || !categories.contains(&t.category),
                 ToolFilter::Category(c) => &t.category == c,
             })

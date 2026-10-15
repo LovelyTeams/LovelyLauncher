@@ -23,6 +23,7 @@ windows-registry = "0.5"
 pulldown-cmark = { version = "0.13", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 quick-xml = "0.42"
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "multi_barcode_readers", "full_barcode_format_support", "encoding_rs"] }
 
 [dependencies.windows]
 version = "0.61"
@@ -46,6 +47,7 @@ features = [
     "Win32_System_DataExchange",
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
@@ -57,6 +59,10 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[dev-dependencies]
+# Tests draw codes to decode them again.
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "encoders", "multi_barcode_readers", "full_barcode_format_support", "encoding_rs"] }
 
 [build-dependencies]
 embed-resource = "3.0"

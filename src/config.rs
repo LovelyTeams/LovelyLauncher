@@ -49,6 +49,8 @@ pub struct Tool {
     pub icon_path: String,
     pub color: String,
     pub favorite: bool,
+    /// Picked for the Alt ring (the "圆环" tab).
+    pub ring: bool,
     /// When set and `target` doesn't exist yet, the program is downloaded there first.
     pub download_url: String,
     /// User category name; empty = uncategorized.
@@ -68,6 +70,7 @@ impl Default for Tool {
             icon_path: String::new(),
             color: "blue".into(),
             favorite: false,
+            ring: false,
             download_url: String::new(),
             category: String::new(),
         }
@@ -134,6 +137,8 @@ pub struct Settings {
     pub alt_ring: bool,
     /// …except while a full-screen program (a game, a video) is in front.
     pub ring_skip_fullscreen: bool,
+    /// …or while one of these programs (exe file names) is in front.
+    pub ring_excluded: Vec<String>,
     /// User-chosen ffmpeg.exe; empty = our downloaded copy or one on PATH.
     pub ffmpeg_path: String,
 }
@@ -245,6 +250,7 @@ impl Default for Settings {
             preview_wrap: true,
             alt_ring: true,
             ring_skip_fullscreen: true,
+            ring_excluded: Vec::new(),
             ffmpeg_path: String::new(),
         }
     }

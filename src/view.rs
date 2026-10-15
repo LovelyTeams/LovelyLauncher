@@ -14,6 +14,13 @@ use crate::{
     theme::Theme,
 };
 
+/// What dropping a dragged tool on a tab does.
+#[derive(Clone)]
+enum TabDrop {
+    Category(String),
+    Ring,
+}
+
 /// Size-dependent layout values, recomputed from the viewport every frame so the
 /// dashboard fits small logical resolutions (e.g. 1080p at 150% scaling).
 #[derive(Clone, Copy, Debug)]
@@ -655,7 +662,7 @@ impl Launcher {
 
         // --- Category tabs -------------------------------------------------
         let mut tabs: Vec<AnyElement> = Vec::new();
-        let tab = |ix: usize, label: String, n: usize, filter: ToolFilter, drop_category: Option<String>, cx: &mut Context<Self>| {
+        let tab = |ix: usize, label: String, count: String, filter: ToolFilter, drop: Option<TabDrop>, cx: &mut Context<Self>| {
             let selected = current == filter;
             let menu = match &filter {
                 ToolFilter::Category(c) => Some(MenuTarget::Category(c.clone())),
@@ -686,13 +693,14 @@ impl Launcher {
                 .when_some(menu, |d, menu| {
                     d.on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(menu, cx))
                 })
-                .when_some(drop_category, |d, category| {
+                .when_some(drop, |d, drop| {
                     d.drag_over::<DraggedTool>(|s, _, _, cx| {
                         let t = Theme::get(cx);
                         s.border_color(t.accent).bg(t.accent_soft).text_color(t.accent)
                     })
-                    .on_drop(cx.listener(move |this, dragged: &DraggedTool, _, cx| {
-                        this.set_tool_category(&dragged.id, &category, cx)
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTool, _, cx| match &drop {
+                        TabDrop::Category(category) => this.set_tool_category(&dragged.id, category, cx),
+                        TabDrop::Ring => this.add_to_ring(&dragged.id, cx),
                     }))
                 })
                 .child(label)
@@ -700,18 +708,27 @@ impl Launcher {
                     div()
                         .text_size(px(11.))
                         .opacity(0.75)
-                        .child(n.to_string()),
+                        .child(count),
                 );
             el.into_any_element()
         };
-        tabs.push(tab(0, "全部".into(), total, ToolFilter::All, None, cx));
+        tabs.push(tab(0, "全部".into(), total.to_string(), ToolFilter::All, None, cx));
+        let ring_count = all.iter().filter(|t| t.ring).count();
+        tabs.push(tab(
+            9999,
+            "圆环".into(),
+            format!("{ring_count}/{}", crate::ring::MAX_ITEMS),
+            ToolFilter::Ring,
+            Some(TabDrop::Ring),
+            cx,
+        ));
         for (ix, (category, n)) in categories.iter().zip(&category_counts).enumerate() {
             tabs.push(tab(
                 ix + 1,
                 category.clone(),
-                *n,
+                n.to_string(),
                 ToolFilter::Category(category.clone()),
-                Some(category.clone()),
+                Some(TabDrop::Category(category.clone())),
                 cx,
             ));
         }
@@ -719,9 +736,9 @@ impl Launcher {
             tabs.push(tab(
                 categories.len() + 1,
                 "未分类".into(),
-                uncategorized,
+                uncategorized.to_string(),
                 ToolFilter::Uncategorized,
-                Some(String::new()),
+                Some(TabDrop::Category(String::new())),
                 cx,
             ));
         }
@@ -841,6 +858,7 @@ impl Launcher {
             _ => String::new(),
         };
         let add_category = prefill_category.clone();
+        let add_to_ring = self.tool_filter == ToolFilter::Ring && self.config.tools.iter().filter(|t| t.ring).count() < crate::ring::MAX_ITEMS;
         tiles.push(
             div()
                 .id("add-tool-card")
@@ -867,6 +885,7 @@ impl Launcher {
                     let prefill = crate::config::Tool {
                         color: "pink".into(),
                         category: add_category.clone(),
+                        ring: add_to_ring,
                         ..Default::default()
                     };
                     this.open_tool_editor(None, Some(prefill), window, cx)
@@ -883,7 +902,15 @@ impl Launcher {
                     .text_size(px(12.))
                     .text_color(theme.text_faint)
                     .mr(px(8.))
-                    .child("拖动图标可调整顺序，拖到分类标签即可归类"),
+                    .child(if self.tool_filter == ToolFilter::Ring {
+                        if self.config.tools.iter().any(|t| t.ring) {
+                            "按住 Alt 弹出的圆环会显示这里的工具（最多 8 个）"
+                        } else {
+                            "把图标拖到“圆环”标签加入；没选时圆环显示最常用的 8 个"
+                        }
+                    } else {
+                        "拖动图标可调整顺序，拖到分类标签即可归类"
+                    }),
             );
 
         div()
@@ -1522,6 +1549,7 @@ impl Launcher {
             MenuTarget::Tool(id) => {
                 let tool = self.config.tools.iter().find(|t| &t.id == id);
                 let favorite = tool.is_some_and(|t| t.favorite);
+                let in_ring = tool.is_some_and(|t| t.ring);
                 let download = tool.filter(|t| !t.download_url.is_empty()).map(|t| {
                     if self.downloads.contains_key(id) {
                         ("x", "取消下载".to_string(), MenuCommand::CancelDownload(id.clone()), false)
@@ -1538,6 +1566,12 @@ impl Launcher {
                         if favorite { "star" } else { "star-fill" },
                         if favorite { "取消收藏" } else { "收藏" }.into(),
                         MenuCommand::ToggleFavorite(id.clone()),
+                        false,
+                    ),
+                    (
+                        "circle",
+                        if in_ring { "移出圆环" } else { "加入圆环" }.into(),
+                        MenuCommand::ToggleRing(id.clone()),
                         false,
                     ),
                     ("edit", "编辑…".into(), MenuCommand::EditTool(id.clone()), false),
@@ -1631,6 +1665,7 @@ impl Launcher {
             MenuCommand::Open(target) => self.activate(target, false, window, cx),
             MenuCommand::OpenAdmin(target) => self.activate(target, true, window, cx),
             MenuCommand::ToggleFavorite(id) => self.toggle_favorite(&id, cx),
+            MenuCommand::ToggleRing(id) => self.toggle_ring(&id, cx),
             MenuCommand::EditTool(id) => self.open_tool_editor(Some(id), None, window, cx),
             MenuCommand::RevealTool(id) => {
                 if let Some(target) = self.config.tools.iter().find(|t| t.id == id).map(|t| t.target.clone()) {
@@ -1707,6 +1742,7 @@ pub enum MenuCommand {
     Open(Target),
     OpenAdmin(Target),
     ToggleFavorite(String),
+    ToggleRing(String),
     EditTool(String),
     RevealTool(String),
     RemoveTool(String),
@@ -1776,6 +1812,9 @@ impl Render for Launcher {
             }))
             .on_action(cx.listener(|this, _: &TakeScreenshot, window, cx| {
                 this.quick_action(QuickAction::Screenshot, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScanCode, window, cx| {
+                this.quick_action(QuickAction::Scan, window, cx)
             }))
             .on_action(cx.listener(|this, _: &QuickNote, window, cx| {
                 this.quick_action(QuickAction::Note, window, cx)

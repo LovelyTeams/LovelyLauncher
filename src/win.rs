@@ -306,6 +306,77 @@ pub fn fullscreen_app_in_front() -> bool {
     }
 }
 
+/// File name (lower case) of the program that owns the foreground window.
+pub fn foreground_program() -> Option<String> {
+    program_of(unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() })
+}
+
+fn program_of(h: HWND) -> Option<String> {
+    use windows::Win32::{
+        System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW},
+        UI::WindowsAndMessaging::GetWindowThreadProcessId,
+    };
+    if h.is_invalid() {
+        return None;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(process);
+        ok.ok()?;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    Path::new(&path).file_name().map(|n| n.to_string_lossy().to_lowercase())
+}
+
+/// Programs with a visible, titled window right now (to pick exclusions from),
+/// leaving out this app and parts of Windows itself.
+pub fn windowed_programs() -> Vec<String> {
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, TRUE},
+            UI::WindowsAndMessaging::{EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, WS_EX_TOOLWINDOW},
+        },
+        core::BOOL,
+    };
+    unsafe extern "system" fn collect(h: HWND, out: LPARAM) -> BOOL {
+        let list = unsafe { &mut *(out.0 as *mut Vec<HWND>) };
+        let visible = unsafe { IsWindowVisible(h).as_bool() };
+        let tool = unsafe { GetWindowLongW(h, GWL_EXSTYLE) } as u32 & WS_EX_TOOLWINDOW.0 != 0;
+        if visible && !tool && unsafe { GetWindowTextLengthW(h) } > 0 {
+            list.push(h);
+        }
+        TRUE
+    }
+    let mut windows: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut Vec<HWND> as isize));
+    }
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+    const SYSTEM: &[&str] = &[
+        "explorer.exe", "applicationframehost.exe", "textinputhost.exe", "shellexperiencehost.exe",
+        "searchhost.exe", "startmenuexperiencehost.exe", "systemsettings.exe", "lockapp.exe",
+    ];
+    let mut names: Vec<String> = windows
+        .into_iter()
+        .filter_map(program_of)
+        .filter(|n| *n != own && !SYSTEM.contains(&n.as_str()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn class_name(h: HWND) -> String {
     let mut buf = [0u16; 128];
     let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(h, &mut buf) };
