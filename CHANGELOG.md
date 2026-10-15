@@ -2,7 +2,7 @@
 
 LovelyLauncher 的版本变化都记在这里。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## 未发布
+## v0.2.2 · 2026-10-15
 
 ### ✨ 新功能
 
