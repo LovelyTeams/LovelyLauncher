@@ -2367,6 +2367,27 @@ impl Launcher {
                     )))
                     .child(div().text_size(px(13.5)).child("作为 @ai 默认使用的服务商")),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(switch("ai-history-switch", settings.ai_keep_history, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.config.settings.ai_keep_history = !this.config.settings.ai_keep_history;
+                            this.config.save();
+                            cx.notify();
+                        },
+                    )))
+                    .child(div().text_size(px(13.5)).child("保存对话历史"))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .text_color(theme.text_faint)
+                            .child("所有服务商通用，在 @ai 面板点“历史”查看"),
+                    ),
+            )
             .into_any_element()
     }
 

@@ -46,6 +46,7 @@
 
 **🤖 `@ai` 随手问**
 - `@ai 问题` 回车即问，答案流式显示，代码块一键复制
+- 问过的问题自动存进**历史对话**，可筛选、可重新打开
 - 预置 OpenAI、DeepSeek、Claude、Kimi、智谱 GLM，模型列表直接从接口拉取
 
 **🎀 好看，也好改**
@@ -138,9 +139,9 @@ cargo build --release
 | 按键 | 作用 |
 |---|---|
 | `Alt+Space` | 呼出 / 隐藏（默认弹出迷你搜索框） |
-| `↑` `↓` · `Enter` | 选择 · 打开搜索结果；`@ai` 模式下为提问 |
+| `↑` `↓` · `Enter` | 选择 · 打开搜索结果；`@ai` 模式下为提问，历史对话里为打开 |
 | `Ctrl+Enter` | 以管理员身份运行 |
-| `Esc` | 停止 AI 回答 → 清空搜索 → 隐藏窗口 |
+| `Esc` | 返回（历史对话）→ 停止 AI 回答 → 清空搜索 → 隐藏窗口 |
 | `Ctrl+K` | 聚焦搜索框 |
 | `Ctrl+T` · `Ctrl+O` | 新建终端 · 打开项目 |
 | `Ctrl+Shift+S` · `Ctrl+N` | 截图 · 快速笔记 |
@@ -240,8 +241,9 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | OpenAI 兼容 |
 
 - 回答以流式方式实时显示，支持标题、列表和代码块（代码块带语法高亮和“复制”按钮），`Esc` 可随时停止。
+- **历史对话**：回答会自动保存（最多 100 条）。输入 `@ai` 后点提示下面的“历史对话”，或回答面板右上角的“历史”，就能看到以前的问答；在 `@ai` 后面打字可以筛选，`Enter` 打开，打开后再按 `Enter` 会重新提问。可以单条删除或清空，也可以在设置里关闭保存。
 - 接口地址可以改成任何 OpenAI 兼容的服务，比如中转站或本地模型。
-- ⚠️ API Key 以**明文**保存在本机的 `config.json` 里，请不要把这个文件分享给别人。
+- ⚠️ API Key 以**明文**保存在本机的 `config.json` 里，历史对话保存在同一目录的 `ai_history.json` 里，请不要把这两个文件分享给别人。
 
 ## 🎨 主题
 
@@ -280,7 +282,7 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 
 - 默认位置：`%APPDATA%\LovelyLauncher\config.json`（设置页左下角“打开配置文件夹”可以直接打开）
 - 设置环境变量 **`LOVELYLAUNCHER_DATA`** 可以把数据放到别的目录，适合便携使用
-- 自定义图标保存在数据目录的 `icons\` 下；预设程序下载到 `%LOCALAPPDATA%\LovelyLauncher\apps\`，FFmpeg 下载到 `%LOCALAPPDATA%\LovelyLauncher\tools\`
+- AI 历史对话保存在数据目录的 `ai_history.json`；自定义图标保存在数据目录的 `icons\` 下；预设程序下载到 `%LOCALAPPDATA%\LovelyLauncher\apps\`，FFmpeg 下载到 `%LOCALAPPDATA%\LovelyLauncher\tools\`
 - 配置文件可以手动编辑（带不带 BOM 都行）；旧版本的配置会自动迁移
 
 ## 📊 性能
@@ -313,6 +315,7 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | `src/input.rs` | 支持输入法（IME）的单行输入框 |
 | `src/search.rs` | 模糊匹配与拼音搜索 |
 | `src/ai.rs` · `src/http.rs` | AI 接口（OpenAI 兼容 / Anthropic）与 WinHTTP 客户端 |
+| `src/ai_history.rs` | AI 历史对话的保存、筛选和时间显示 |
 | `src/everything.rs` | Everything IPC 文件搜索 |
 | `src/win.rs` | Win32：窗口、图标提取、开始菜单扫描、开机自启 |
 | `src/theme.rs` · `src/config.rs` | 主题生成、配置与迁移 |

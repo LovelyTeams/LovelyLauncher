@@ -563,6 +563,23 @@ pub fn split_command(target: &str) -> Option<(String, String)> {
 
 /// Where a program starts when its tool has no 工作目录: its own folder, as when it
 /// is opened from Explorer. Documents, shortcuts and URIs are left to the shell.
+/// Unix seconds → local (year, month, day, hour, minute), daylight saving included.
+pub fn local_time(ts: u64) -> Option<(u16, u16, u16, u16, u16)> {
+    use windows::Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
+    };
+    // FILETIME counts 100 ns steps since 1601.
+    let ticks = (ts + 11_644_473_600) * 10_000_000;
+    let file_time = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some((local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute))
+}
+
 pub fn default_workdir(program: &str) -> String {
     let Some(path) = resolve_target_path(program) else { return String::new() };
     let runnable = path

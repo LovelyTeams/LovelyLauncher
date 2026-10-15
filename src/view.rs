@@ -179,6 +179,24 @@ fn link(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, theme: &
         .child(label.into())
 }
 
+/// Small text button in the @ai panel's header.
+fn ai_button(id: &'static str, icon_name: &'static str, label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(26.))
+        .px(px(10.))
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .text_size(px(12.))
+        .text_color(theme.text_muted)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.row_hover).text_color(theme.accent))
+        .child(icon(icon_name, 13., theme.text_muted))
+        .child(label.into())
+}
+
 fn panel(theme: &Theme) -> Div {
     div()
         .bg(theme.panel)
@@ -1338,23 +1356,14 @@ impl Launcher {
             .map(|(_, _, m)| m.clone())
             .unwrap_or_else(|| provider.model.clone());
         let configured = !provider.api_key.trim().is_empty() && !provider.model.trim().is_empty();
+        if self.ai_history_open {
+            let (header, body, footer) = self.render_ai_history(&question, theme, cx);
+            return Self::ai_surface(theme, mini, header, body, footer);
+        }
+        let history_count = self.ai_history_mut().len();
 
-        let small_button = |id: &'static str, icon_name: &'static str, label: &'static str, theme: &Theme| {
-            div()
-                .id(id)
-                .h(px(26.))
-                .px(px(10.))
-                .rounded(px(7.))
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .text_size(px(12.))
-                .text_color(theme.text_muted)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.row_hover).text_color(theme.accent))
-                .child(icon(icon_name, 13., theme.text_muted))
-                .child(label)
-        };
+        let small_button =
+            |id: &'static str, icon_name: &'static str, label: &'static str, theme: &Theme| ai_button(id, icon_name, label, theme);
 
         let header = div()
             .flex_none()
@@ -1395,6 +1404,9 @@ impl Launcher {
                     )))
                 },
             )
+            .child(small_button("ai-history", "history", "历史", theme).on_click(cx.listener(
+                |this, _: &ClickEvent, window, cx| this.open_ai_history(window, cx),
+            )))
             .child(small_button("ai-settings", "settings", "设置", theme).on_click(cx.listener(
                 |this, _: &ClickEvent, window, cx| this.open_ai_settings(window, cx),
             )));
@@ -1421,6 +1433,31 @@ impl Launcher {
                     .py(px(10.))
                     .child(div().text_size(px(14.)).text_color(theme.text).child(title))
                     .child(div().text_size(px(12.)).text_color(theme.text_faint).truncate().child(detail))
+                    .child(
+                        div()
+                            .id("ai-history-entry")
+                            .group("ai-history-entry")
+                            .mt(px(8.))
+                            .h(px(26.))
+                            .px(px(12.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.accent_soft).border_color(theme.accent).text_color(theme.accent))
+                            .child(icon_hover("history", 13., theme.text_muted, "ai-history-entry", theme.accent))
+                            .child(if history_count > 0 {
+                                format!("历史对话 · {history_count}")
+                            } else {
+                                "历史对话".to_string()
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_ai_history(window, cx))),
+                    )
                     .into_any_element()
             }
             Some((text, state, _)) => {
@@ -1493,6 +1530,11 @@ impl Launcher {
             .child(div().flex_1())
             .child("@deepseek / @claude / @kimi… 可直接指定服务商");
 
+        Self::ai_surface(theme, mini, header.into_any_element(), body, footer.into_any_element())
+    }
+
+    /// The @ai panel's frame around a header, body and footer.
+    fn ai_surface(theme: &Theme, mini: bool, header: AnyElement, body: AnyElement, footer: AnyElement) -> AnyElement {
         let container = if mini {
             div().flex_1().min_h_0().flex().flex_col()
         } else {
@@ -1512,6 +1554,207 @@ impl Launcher {
                     .child(footer),
             )
             .into_any_element()
+    }
+
+    /// 历史对话 in the @ai panel: (header, body, footer). `filter` is what follows `@ai`.
+    fn render_ai_history(&mut self, filter: &str, theme: &Theme, cx: &mut Context<Self>) -> (AnyElement, AnyElement, AnyElement) {
+        let shown = self.ai_history_shown();
+        let total = self.ai_history_mut().len();
+        let selected = self.ai_history_selected.min(shown.len().saturating_sub(1));
+        let confirm_clear = self.ai_history_confirm_clear;
+        let keep = self.config.settings.ai_keep_history;
+        struct Row {
+            ix: usize,
+            id: String,
+            question: String,
+            preview: String,
+            when: String,
+            source: String,
+        }
+        let rows: Vec<Row> = {
+            let list = self.ai_history_mut();
+            shown
+                .iter()
+                .map(|&ix| {
+                    let c = &list[ix];
+                    Row {
+                        ix,
+                        id: c.id.clone(),
+                        question: c.question.clone(),
+                        preview: c.preview(),
+                        when: crate::ai_history::when(c.time),
+                        source: if c.model.is_empty() { c.provider.clone() } else { format!("{} · {}", c.provider, c.model) },
+                    }
+                })
+                .collect()
+        };
+
+        let count = if filter.is_empty() { format!("共 {total} 条") } else { format!("{} / {total} 条", rows.len()) };
+        let header = div()
+            .flex_none()
+            .h(px(44.))
+            .px(px(16.))
+            .border_b_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(icon("history", 16., theme.accent))
+            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("历史对话"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(1.))
+                    .rounded(px(6.))
+                    .bg(theme.kbd_bg)
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(count),
+            )
+            .child(div().flex_1())
+            .when(total > 0, |d| {
+                d.child(
+                    ai_button("ai-history-clear", "trash", if confirm_clear { "再点一次清空" } else { "清空" }, theme)
+                        .when(confirm_clear, |b| b.text_color(theme.danger))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.clear_ai_history(cx))),
+                )
+            })
+            .child(
+                ai_button("ai-history-back", "arrow-left", "返回", theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_ai_history(cx))),
+            )
+            .into_any_element();
+
+        let body = if rows.is_empty() {
+            let (title, detail) = if total == 0 {
+                (
+                    "还没有历史对话".to_string(),
+                    if keep {
+                        "向 AI 提问后，回答会自动保存在这里".to_string()
+                    } else {
+                        "已在 设置 → AI 助手 中关闭了保存对话历史".to_string()
+                    },
+                )
+            } else {
+                (format!("没有包含“{filter}”的对话"), "换个关键词试试".to_string())
+            };
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(4.))
+                .py(px(10.))
+                .child(div().text_size(px(14.)).text_color(theme.text).child(title))
+                .child(div().text_size(px(12.)).text_color(theme.text_faint).child(detail))
+                .into_any_element()
+        } else {
+            let items = rows.into_iter().enumerate().map(|(n, row)| {
+                let is_selected = n == selected;
+                let ix = row.ix;
+                let id = row.id;
+                div()
+                    .id(("ai-hist", n))
+                    .group("ai-hist-row")
+                    .flex_none()
+                    .h(px(58.))
+                    .mx(px(8.))
+                    .px(px(12.))
+                    .rounded(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .cursor_pointer()
+                    .when(is_selected, |d| d.bg(theme.accent_soft))
+                    .when(!is_selected, |d| d.hover(|s| s.bg(theme.row_hover)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_ai_conversation(ix, window, cx)
+                    }))
+                    .child(icon("message", 15., if is_selected { theme.accent } else { theme.text_faint }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .child(div().text_size(px(13.5)).text_color(theme.text).truncate().child(row.question))
+                            .child(div().text_size(px(12.)).text_color(theme.text_faint).truncate().child(row.preview)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(200.))
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .gap(px(3.))
+                            .child(div().text_size(px(11.5)).text_color(theme.text_muted).child(row.when))
+                            .child(div().max_w_full().text_size(px(11.)).text_color(theme.text_faint).truncate().child(row.source)),
+                    )
+                    // Delete; shows while the row is hovered.
+                    .child(
+                        div()
+                            .id(("ai-hist-del", n))
+                            .flex_none()
+                            .size(px(26.))
+                            .rounded(px(7.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.)
+                            .group_hover("ai-hist-row", |s| s.opacity(1.))
+                            .hover(|s| s.bg(theme.danger.opacity(0.12)))
+                            .child(icon("trash", 13., theme.text_faint))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.delete_ai_conversation(&id, cx);
+                                }),
+                            ),
+                    )
+            });
+            div()
+                .id("ai-history-list")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.ai_history_scroll)
+                .py(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(items)
+                .into_any_element()
+        };
+
+        let hint = |keys: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(kbd(keys, theme))
+                .child(label)
+        };
+        let footer = div()
+            .flex_none()
+            .h(px(40.))
+            .px(px(16.))
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .gap(px(18.))
+            .text_size(px(12.))
+            .text_color(theme.text_faint)
+            .child(hint("↑↓", "选择"))
+            .child(hint("Enter", "打开"))
+            .child(hint("Esc", "返回"))
+            .child(div().flex_1())
+            .child("在 @ai 后面输入文字可以筛选")
+            .into_any_element();
+        (header, body, footer)
     }
 
     // -----------------------------------------------------------------------

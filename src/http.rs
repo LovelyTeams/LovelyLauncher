@@ -8,7 +8,8 @@ use windows::{
     Win32::Networking::WinHttp::{
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
         WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
+        WinHttpQueryHeaders,
         WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     },
     core::{HSTRING, PCWSTR},
@@ -153,8 +154,17 @@ pub fn send(
 
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            // Wait for whatever has arrived and take just that: a plain read waits until
+            // the whole buffer is full, which holds back streamed answers until the end.
+            let mut available = 0u32;
+            WinHttpQueryDataAvailable(request.0, &mut available)
+                .map_err(|e| format!("连接中断：{}", e.message()))?;
+            if available == 0 {
+                break;
+            }
             let mut read = 0u32;
-            WinHttpReadData(request.0, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut read)
+            let want = available.min(buf.len() as u32);
+            WinHttpReadData(request.0, buf.as_mut_ptr() as *mut c_void, want, &mut read)
                 .map_err(|e| format!("连接中断：{}", e.message()))?;
             if read == 0 || !on_data(&buf[..read as usize]) {
                 break;

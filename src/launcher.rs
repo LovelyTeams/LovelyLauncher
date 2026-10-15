@@ -394,6 +394,15 @@ pub struct Launcher {
     /// The latest `@ai` answer (kept while its question is still in the box).
     pub(crate) ai: Option<AiAnswer>,
     pub(crate) ai_scroll: ScrollHandle,
+    /// 历史对话, read from disk the first time it is needed.
+    ai_history: Option<Vec<crate::ai_history::Conversation>>,
+    /// The @ai panel lists 历史对话 instead of the answer.
+    pub(crate) ai_history_open: bool,
+    /// Highlighted row among the listed conversations.
+    pub(crate) ai_history_selected: usize,
+    pub(crate) ai_history_scroll: ScrollHandle,
+    /// 清空 was clicked once; the next click really clears.
+    pub(crate) ai_history_confirm_clear: bool,
     pub(crate) update: UpdateState,
     pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
     /// The Alt ring popup, created on first use and then kept (hidden) for reuse.
@@ -506,6 +515,11 @@ impl Launcher {
             results_scroll: ScrollHandle::new(),
             ai: None,
             ai_scroll: ScrollHandle::new(),
+            ai_history: None,
+            ai_history_open: false,
+            ai_history_selected: 0,
+            ai_history_scroll: ScrollHandle::new(),
+            ai_history_confirm_clear: false,
             update: UpdateState::default(),
             preview: None,
             ring: None,
@@ -1651,9 +1665,16 @@ impl Launcher {
                         let Some(answer) = this.ai.as_mut().filter(|a| Arc::ptr_eq(&a.cancel, &cancel)) else {
                             return false;
                         };
+                        if answer.state != AiState::Streaming {
+                            // Stopped: pieces still on their way are dropped.
+                            return false;
+                        }
                         match msg {
                             AiMsg::Text(text) => answer.text.push_str(&text),
-                            AiMsg::Finished(Ok(())) => answer.state = AiState::Done,
+                            AiMsg::Finished(Ok(())) => {
+                                answer.state = AiState::Done;
+                                this.remember_answer();
+                            }
                             AiMsg::Finished(Err(err)) => answer.state = AiState::Failed(err),
                         }
                         this.ai_scroll.scroll_to_bottom();
@@ -1675,7 +1696,16 @@ impl Launcher {
             Some(answer) if answer.state == AiState::Streaming => {
                 answer.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 answer.state = AiState::Done;
+                // Stopped before anything came back: nothing worth keeping.
+                let answered = !answer.text.trim().is_empty();
+                // Cut off inside a code block: close it so the note isn't shown as code.
+                if answer.text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1 {
+                    answer.text.push_str("\n```");
+                }
                 answer.text.push_str("\n\n（已停止）");
+                if answered {
+                    self.remember_answer();
+                }
                 cx.notify();
                 true
             }
@@ -1683,7 +1713,138 @@ impl Launcher {
         }
     }
 
+    /// Save the current answer to 历史对话.
+    fn remember_answer(&mut self) {
+        let Some(answer) = self.ai.as_ref().filter(|a| !a.text.trim().is_empty()) else {
+            return;
+        };
+        if !self.config.settings.ai_keep_history {
+            return;
+        }
+        let provider = self
+            .config
+            .settings
+            .ai_providers
+            .iter()
+            .find(|p| p.id == answer.provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| answer.provider_id.clone());
+        let conversation = crate::ai_history::Conversation {
+            id: crate::config::new_id(),
+            time: crate::config::now_secs(),
+            provider_id: answer.provider_id.clone(),
+            provider,
+            model: answer.model.clone(),
+            question: answer.question.clone(),
+            answer: answer.text.clone(),
+        };
+        let list = self.ai_history_mut();
+        crate::ai_history::remember(list, conversation);
+        crate::ai_history::save(list);
+    }
+
+    pub fn ai_history_mut(&mut self) -> &mut Vec<crate::ai_history::Conversation> {
+        self.ai_history.get_or_insert_with(crate::ai_history::load)
+    }
+
+    /// Indices of the conversations to list: those matching what follows `@ai`.
+    pub fn ai_history_shown(&mut self) -> Vec<usize> {
+        let filter = self.ai_request().map(|(_, q)| q).unwrap_or_default();
+        self.ai_history_mut()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches(&filter))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// Show 历史对话 in the @ai panel. What was typed after `@ai` becomes a filter,
+    /// so it starts out empty.
+    pub fn open_ai_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prefix = crate::ai::parse_prefix(&self.search_text).map(|(id, _)| id).unwrap_or_else(|| "ai".into());
+        self.ai_history_open = true;
+        self.ai_history_selected = 0;
+        self.ai_history_confirm_clear = false;
+        self.ai_history_scroll.set_offset(Default::default());
+        self.search.update(cx, |input, cx| input.set_text(format!("@{prefix} "), cx));
+        window.focus(&self.search.focus_handle(cx));
+        self.sync_mini_size(cx);
+        cx.notify();
+    }
+
+    pub fn close_ai_history(&mut self, cx: &mut Context<Self>) {
+        self.ai_history_open = false;
+        self.ai_history_confirm_clear = false;
+        self.sync_mini_size(cx);
+        cx.notify();
+    }
+
+    /// Bring conversation `ix` back into the answer panel, as if just asked, so
+    /// Enter asks it again and 复制回答 works.
+    pub fn open_ai_conversation(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.ai_history_mut().get(ix).cloned() else {
+            return;
+        };
+        let settings = &self.config.settings;
+        // `@ai` when it was the default provider (or that provider is gone), else `@<id>`.
+        let (prefix, provider_id) = match settings.ai_providers.iter().find(|p| p.id == c.provider_id) {
+            Some(p) if settings.active_ai().is_some_and(|a| a.id == p.id) => ("ai".to_string(), p.id.clone()),
+            Some(p) => (p.id.clone(), p.id.clone()),
+            None => ("ai".to_string(), settings.active_ai().map(|p| p.id.clone()).unwrap_or_default()),
+        };
+        if let Some(previous) = &self.ai {
+            previous.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.ai = Some(AiAnswer {
+            question: c.question.clone(),
+            provider_id,
+            model: c.model,
+            text: c.answer,
+            state: AiState::Done,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        self.ai_history_open = false;
+        self.ai_history_confirm_clear = false;
+        self.ai_scroll.set_offset(Default::default());
+        self.search.update(cx, |input, cx| input.set_text(format!("@{prefix} {}", c.question), cx));
+        window.focus(&self.search.focus_handle(cx));
+        self.sync_mini_size(cx);
+        cx.notify();
+    }
+
+    pub fn delete_ai_conversation(&mut self, id: &str, cx: &mut Context<Self>) {
+        let list = self.ai_history_mut();
+        list.retain(|c| c.id != id);
+        crate::ai_history::save(list);
+        let shown = self.ai_history_shown().len();
+        self.ai_history_selected = self.ai_history_selected.min(shown.saturating_sub(1));
+        cx.notify();
+    }
+
+    /// 清空: the first click asks, the second one clears.
+    pub fn clear_ai_history(&mut self, cx: &mut Context<Self>) {
+        if !self.ai_history_confirm_clear {
+            self.ai_history_confirm_clear = true;
+        } else {
+            self.ai_history_confirm_clear = false;
+            let list = self.ai_history_mut();
+            list.clear();
+            crate::ai_history::save(list);
+            self.ai_history_selected = 0;
+        }
+        cx.notify();
+    }
+
     fn on_query_changed(&mut self, cx: &mut Context<Self>) {
+        if self.ai_history_open {
+            if self.ai_request().is_none() {
+                self.ai_history_open = false;
+            }
+            // The list is filtered by what is typed.
+            self.ai_history_selected = 0;
+            self.ai_history_confirm_clear = false;
+            self.ai_history_scroll.set_offset(Default::default());
+        }
         self.refresh_results();
         self.schedule_everything(cx);
         self.sync_mini_size(cx);
@@ -1791,8 +1952,13 @@ impl Launcher {
 
     fn mini_height(&self) -> f32 {
         if self.ai_request().is_some() {
-            // bar + divider + answer panel (or the one-line hint) + footer
-            let body = if self.current_answer().is_some() { 400. } else { 72. };
+            // bar + divider + answer panel (or the hint) + footer
+            let body = if self.ai_history_open || self.current_answer().is_some() {
+                400.
+            } else {
+                // header, the hint and the 历史对话 entry under it
+                148.
+            };
             return Self::MINI_BAR + 1. + body + 40.;
         }
         let rows = self.results.len().min(Self::MINI_MAX_ROWS);
@@ -2517,7 +2683,25 @@ impl Launcher {
     // -----------------------------------------------------------------------
     // Keyboard actions
 
+    /// Move the highlight in 历史对话; returns whether the list is open.
+    fn step_ai_history(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        if !self.ai_history_open || self.dialog.is_some() || self.ai_request().is_none() {
+            return false;
+        }
+        let count = self.ai_history_shown().len();
+        if count > 0 {
+            let ix = self.ai_history_selected.min(count - 1);
+            self.ai_history_selected = if forward { (ix + 1) % count } else { (ix + count - 1) % count };
+            self.ai_history_scroll.scroll_to_item(self.ai_history_selected);
+            cx.notify();
+        }
+        true
+    }
+
     pub fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if self.step_ai_history(false, cx) {
+            return;
+        }
         if self.dialog.is_some() || self.results.is_empty() {
             return;
         }
@@ -2531,6 +2715,9 @@ impl Launcher {
     }
 
     pub fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.step_ai_history(true, cx) {
+            return;
+        }
         if self.dialog.is_some() || self.results.is_empty() {
             return;
         }
@@ -2545,6 +2732,12 @@ impl Launcher {
             return;
         }
         if self.ai_request().is_some() {
+            if self.ai_history_open {
+                if let Some(&ix) = self.ai_history_shown().get(self.ai_history_selected) {
+                    self.open_ai_conversation(ix, window, cx);
+                }
+                return;
+            }
             self.start_ai(cx);
             return;
         }
@@ -2571,6 +2764,10 @@ impl Launcher {
         }
         if self.dialog.is_some() {
             self.close_dialog(window, cx);
+            return;
+        }
+        if self.ai_history_open && self.ai_request().is_some() {
+            self.close_ai_history(cx);
             return;
         }
         if self.stop_ai(cx) {
