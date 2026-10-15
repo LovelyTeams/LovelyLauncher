@@ -60,6 +60,7 @@
 **👀 空格快速预览**
 - 在资源管理器或桌面选中文件按**空格**即可预览，方向键切换、再按空格关闭
 - Markdown、图片、文本（自动识别 GBK）、Word、Excel、CSV / TSV、音频、视频
+- 代码**语法高亮**，压缩过的 JSON / XML **自动美化**，一键切回原文
 
 **🪟 用着顺手**
 - `Alt+Space` 呼出**迷你搜索框**，一键还原完整窗口
@@ -169,13 +170,20 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 |---|---|---|
 | Markdown | `.md` | 完整渲染：标题、列表、任务列表、表格、代码块、本地图片 |
 | 图片 | png / jpg / gif / bmp / webp / ico / tiff / svg | GIF 支持动画 |
-| 文本与代码 | txt / log / json / yaml / 各类源码…… | 自动识别 UTF-8 / UTF-16 / GBK，大文件只读前 4 MB |
+| 文本与代码 | txt / log / json / xml / yaml / 各类源码…… | 语法高亮；JSON / XML 自动美化；自动识别 UTF-8 / UTF-16 / GBK，大文件只读前 4 MB |
 | 表格 | `.csv` `.tsv` `.xlsx` | 行列号、多工作表切换，最多 10 万行 |
 | 文档 | `.docx` | 标题、加粗 / 斜体、列表、表格、内嵌图片 |
 | 音频 | mp3 / wav / wma / mid | Windows 自带，**无需额外安装** |
 | 音频（更多） | flac / ogg / opus / m4a / aac…… | 需要 FFmpeg |
 | 视频 | mp4 / mkv / mov / avi / webm…… | 需要 FFmpeg |
 | 文件夹 | — | 列出内容与大小 |
+
+**代码高亮与美化**
+
+- 支持 Rust、JavaScript / TypeScript、Python、C / C++、Java / Kotlin、C#、Go、Swift、PHP、Ruby、Lua、Shell、PowerShell、批处理、SQL、JSON、CSS、HTML / XML、YAML、TOML / INI、diff 等，没有扩展名的脚本按 `#!` 行识别
+- 压缩成一行的 JSON（包括带注释的 JSONC）和 XML 会自动缩进排版，键的顺序、注释、数字写法都原样保留；标题栏的“查看原文 / 格式化”可以来回切换
+- Markdown 和 AI 回答里的代码块也会按语言高亮
+- 超过 2 MB 的文件只显示纯文本，不做高亮
 
 **FFmpeg**：第一次预览视频时会提示，可以一键下载（来自 gyan.dev 的 essentials 版本，约 110 MB），也可以选择本机已有的 `ffmpeg.exe`；`PATH` 里有 ffmpeg 也会自动使用。
 
@@ -199,7 +207,7 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | Kimi | `https://api.moonshot.cn/v1` | OpenAI 兼容 |
 | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | OpenAI 兼容 |
 
-- 回答以流式方式实时显示，支持标题、列表和代码块（代码块带“复制”按钮），`Esc` 可随时停止。
+- 回答以流式方式实时显示，支持标题、列表和代码块（代码块带语法高亮和“复制”按钮），`Esc` 可随时停止。
 - 接口地址可以改成任何 OpenAI 兼容的服务，比如中转站或本地模型。
 - ⚠️ API Key 以**明文**保存在本机的 `config.json` 里，请不要把这个文件分享给别人。
 
@@ -256,6 +264,7 @@ LovelyLauncher 运行时，在**资源管理器或桌面**选中一个文件，�
 | `src/dialogs.rs` | 编辑工具、设置（通用 / 外观 / 预览 / AI / 搜索）、分类对话框 |
 | `src/preview/` | 空格预览：键盘钩子与选中文件读取（`hook.rs`）、预览窗口（`mod.rs`）、Office / CSV / 编码（`office.rs`）、播放器（`media.rs`）、FFmpeg（`ffmpeg.rs`） |
 | `src/markdown.rs` | Markdown 渲染（预览与 AI 回答共用） |
+| `src/highlight.rs` | 语法高亮与 JSON / XML 美化 |
 | `src/update.rs` | 从 GitHub Releases 自动更新 |
 | `src/input.rs` | 支持输入法（IME）的单行输入框 |
 | `src/search.rs` | 模糊匹配与拼音搜索 |

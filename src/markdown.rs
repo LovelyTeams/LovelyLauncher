@@ -11,7 +11,7 @@ use gpui::{
     AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, IntoElement, ObjectFit,
     StrikethroughStyle, StyledImage, StyledText, UnderlineStyle, div, img, prelude::*, px,
 };
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::theme::Theme;
 
@@ -28,6 +28,7 @@ pub fn render(source: &str, base_dir: Option<&Path>, theme: &Theme) -> Vec<AnyEl
         styles: Vec::new(),
         heading: None,
         code: None,
+        code_lang: None,
         image: None,
         pending_images: Vec::new(),
         table: None,
@@ -85,6 +86,8 @@ struct Renderer<'a> {
     styles: Vec<HighlightStyle>,
     heading: Option<u8>,
     code: Option<String>,
+    /// Fence language of the current code block ("rust", "json", …).
+    code_lang: Option<String>,
     /// (destination, alt text) while inside an image tag.
     image: Option<(String, String)>,
     pending_images: Vec<AnyElement>,
@@ -164,9 +167,13 @@ impl Renderer<'_> {
                 self.flush_inline();
                 self.stack.push(Frame::new(Container::Quote));
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_inline();
                 self.code = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => info.split_whitespace().next().map(str::to_string),
+                    CodeBlockKind::Indented => None,
+                };
             }
             Tag::List(start) => {
                 self.flush_inline();
@@ -419,9 +426,27 @@ impl Renderer<'_> {
         self.add_block(el);
     }
 
-    fn code_block(&self, code: String) -> AnyElement {
+    fn code_block(&mut self, code: String) -> AnyElement {
         let theme = self.theme;
-        let code = code.trim_end_matches('\n').to_string();
+        let code = code.trim_end_matches('\n').replace('\t', "    ");
+        let lang = self
+            .code_lang
+            .take()
+            .and_then(|name| crate::highlight::lang_for_name(&name));
+        let highlights = lang.map(|l| crate::highlight::by_line(&code, &crate::highlight::highlight(&code, l)));
+        let lines: Vec<AnyElement> = code
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                let spans = highlights.as_ref().and_then(|h| h.get(i)).filter(|s| !s.is_empty());
+                match spans {
+                    Some(spans) => div()
+                        .child(StyledText::new(l.to_string()).with_highlights(crate::highlight::styled(spans, theme.dark)))
+                        .into_any_element(),
+                    None => div().child(if l.is_empty() { " ".to_string() } else { l.to_string() }).into_any_element(),
+                }
+            })
+            .collect();
         let copy = code.clone();
         let id = COPY_IDS.fetch_add(1, Ordering::Relaxed);
         div()
@@ -436,7 +461,7 @@ impl Renderer<'_> {
             .font_family("Consolas")
             .text_size(px(12.5))
             .line_height(px(19.))
-            .children(code.lines().map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })).collect::<Vec<_>>())
+            .children(lines)
             .child(
                 div()
                     .id(("md-copy", id))

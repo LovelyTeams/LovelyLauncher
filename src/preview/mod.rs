@@ -23,6 +23,7 @@ use gpui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
+    highlight,
     launcher::Launcher,
     preview::{
         ffmpeg::FfmpegState,
@@ -125,8 +126,28 @@ pub fn human_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
 }
 
+/// Lines of a text file plus per-line syntax spans.
+pub struct TextDoc {
+    lines: Vec<SharedString>,
+    highlights: Option<Vec<highlight::Spans>>,
+}
+
+/// Highlighting very large files isn't worth the memory.
+const HIGHLIGHT_LIMIT: usize = 2 * 1024 * 1024;
+
+fn text_doc(text: &str, lang: Option<&'static highlight::Lang>) -> TextDoc {
+    let highlights = lang
+        .filter(|_| text.len() <= HIGHLIGHT_LIMIT)
+        .map(|l| highlight::by_line(text, &highlight::highlight(text, l)));
+    TextDoc {
+        lines: text.split('\n').map(|l| SharedString::from(l.to_string())).collect(),
+        highlights,
+    }
+}
+
 enum Loaded {
-    Text(Vec<SharedString>),
+    /// Shown document, plus the original when it was pretty-printed.
+    Text(TextDoc, Option<TextDoc>),
     Markdown(String),
     Image,
     Table(Vec<Sheet>, Vec<Vec<f32>>),
@@ -139,7 +160,13 @@ enum Loaded {
 enum Content {
     Loading,
     Error(String),
-    Text { lines: Arc<Vec<SharedString>>, list: ListState },
+    Text {
+        doc: Arc<TextDoc>,
+        /// The other view (raw ⇄ formatted), when the file was pretty-printed.
+        alt: Option<Arc<TextDoc>>,
+        formatted: bool,
+        list: ListState,
+    },
     Markdown(Arc<String>),
     Image,
     Table { sheets: Arc<Vec<Sheet>>, widths: Arc<Vec<Vec<f32>>> },
@@ -286,9 +313,15 @@ impl Preview {
                             this.meta = format!("{} · {meta}", this.meta).into();
                         }
                         this.content = match loaded {
-                            Loaded::Text(lines) => {
-                                let list = ListState::new(lines.len(), ListAlignment::Top, px(600.));
-                                Content::Text { lines: Arc::new(lines), list }
+                            Loaded::Text(doc, alt) => {
+                                let list = ListState::new(doc.lines.len(), ListAlignment::Top, px(600.));
+                                let formatted = alt.is_some();
+                                Content::Text {
+                                    doc: Arc::new(doc),
+                                    alt: alt.map(Arc::new),
+                                    formatted,
+                                    list,
+                                }
                             }
                             Loaded::Markdown(source) => Content::Markdown(Arc::new(source)),
                             Loaded::Image => Content::Image,
@@ -455,6 +488,28 @@ impl Preview {
         .detach();
     }
 
+    /// Swap between the pretty-printed and the original text.
+    fn toggle_formatted(&mut self, cx: &mut Context<Self>) {
+        if let Content::Text { doc, alt: Some(alt), formatted, list } = &mut self.content {
+            std::mem::swap(doc, alt);
+            *formatted = !*formatted;
+            list.reset(doc.lines.len());
+            let flag = if *formatted { "已格式化" } else { "原文" };
+            let lines = format!("{} 行", doc.lines.len());
+            // Keep the size first, then insert the view flag after the language name.
+            let mut parts: Vec<&str> = self
+                .meta
+                .split(" · ")
+                .filter(|p| !matches!(*p, "已格式化" | "原文"))
+                .map(|p| if p.ends_with(" 行") { lines.as_str() } else { p })
+                .collect();
+            let at = parts.len().min(2);
+            parts.insert(at, flag);
+            self.meta = parts.join(" · ").into();
+            cx.notify();
+        }
+    }
+
     fn open_default(&mut self, cx: &mut Context<Self>) {
         let path = self.path.display().to_string();
         cx.background_spawn(async move {
@@ -559,16 +614,39 @@ fn load(path: &Path, kind: Kind) -> Result<(Loaded, String), String> {
 fn load_text(path: &Path) -> Result<(Loaded, String), String> {
     let (bytes, truncated) = office::read_prefix(path, TEXT_LIMIT)?;
     let (text, encoding) = office::decode_text(&bytes);
-    let lines: Vec<SharedString> = text
-        .split('\n')
-        .map(|l| SharedString::from(l.trim_end_matches('\r').replace('\t', "    ")))
-        .collect();
-    let meta = format!(
-        "{encoding} · {} 行{}",
-        lines.len(),
-        if truncated { " · 仅显示前 4 MB" } else { "" }
-    );
-    Ok((Loaded::Text(lines), meta))
+    // Normalise once so line splits and highlight offsets agree.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
+    let ext = ext_of(path);
+    let lang = highlight::lang_for_ext(&ext)
+        .or_else(|| highlight::lang_for_shebang(text.lines().next().unwrap_or("")));
+
+    // Structured data is pretty-printed (the original stays one click away).
+    let xml_like = !matches!(ext.as_str(), "html" | "htm" | "xhtml" | "vue" | "svelte");
+    let pretty = match lang {
+        _ if truncated => None,
+        Some(l) if highlight::is_json(l) => highlight::pretty_json(&text),
+        Some(l) if highlight::is_markup(l) && xml_like => highlight::pretty_xml(&text),
+        _ => None,
+    }
+    .filter(|p| p.trim() != text.trim());
+
+    let (doc, alt) = match pretty {
+        Some(p) => (text_doc(&p, lang), Some(text_doc(&text, lang))),
+        None => (text_doc(&text, lang), None),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(l) = lang {
+        parts.push(l.name.to_string());
+    }
+    if alt.is_some() {
+        parts.push("已格式化".into());
+    }
+    parts.push(encoding.to_string());
+    parts.push(format!("{} 行", doc.lines.len()));
+    if truncated {
+        parts.push("仅显示前 4 MB".into());
+    }
+    Ok((Loaded::Text(doc, alt), parts.join(" · ")))
 }
 
 fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
@@ -689,6 +767,18 @@ impl Preview {
                     .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).truncate().child(name))
                     .child(div().text_size(px(11.5)).text_color(theme.text_faint).truncate().child(self.meta.clone())),
             )
+            .when_some(
+                match &self.content {
+                    Content::Text { alt: Some(_), formatted, .. } => Some(*formatted),
+                    _ => None,
+                },
+                |d, formatted| {
+                    d.child(
+                        button("toggle-format", "code", if formatted { "查看原文" } else { "格式化" }, theme)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_formatted(cx))),
+                    )
+                },
+            )
             .child(button("open-default", "external", "打开", theme).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| this.open_default(cx),
             )))
@@ -744,12 +834,18 @@ impl Preview {
                     .child(div().w_full().flex().flex_col().gap(px(8.)).children(blocks))
                     .into_any_element()
             }
-            Content::Text { lines, list: state } => {
-                let lines = lines.clone();
-                let (faint, text) = (theme.text_faint, theme.text);
-                let digits = lines.len().to_string().len().max(2) as f32;
+            Content::Text { doc, list: state, .. } => {
+                let doc = doc.clone();
+                let (faint, text, dark) = (theme.text_faint, theme.text, theme.dark);
+                let digits = doc.lines.len().to_string().len().max(2) as f32;
                 list(state.clone(), move |ix, _, _| {
-                    let line = lines[ix].clone();
+                    let line = doc.lines[ix].clone();
+                    let spans = doc.highlights.as_ref().and_then(|h| h.get(ix)).filter(|s| !s.is_empty());
+                    let content: AnyElement = match spans {
+                        Some(spans) => StyledText::new(line).with_highlights(highlight::styled(spans, dark)).into_any_element(),
+                        None if line.is_empty() => " ".into_any_element(),
+                        None => line.into_any_element(),
+                    };
                     div()
                         .flex()
                         .px(px(12.))
@@ -765,13 +861,7 @@ impl Preview {
                                 .text_color(faint)
                                 .child((ix + 1).to_string()),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_color(text)
-                                .child(if line.is_empty() { SharedString::from(" ") } else { line }),
-                        )
+                        .child(div().flex_1().min_w_0().text_color(text).child(content))
                         .into_any_element()
                 })
                 .size_full()

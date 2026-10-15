@@ -10,6 +10,7 @@ mod http;
 mod icon_image;
 mod icons;
 mod input;
+mod highlight;
 mod launcher;
 mod markdown;
 mod preview;
