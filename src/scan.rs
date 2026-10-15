@@ -24,9 +24,12 @@ pub struct Code {
     /// "二维码", "条形码（EAN-13）", …
     pub kind: String,
     pub text: String,
-    /// Where it was found: "剪贴板图片", "屏幕 1", …
-    pub source: String,
-    /// A grey picture of the code (width, height, BGRA), so results can be told apart.
+    /// Index into [`ScanOutput::sources`].
+    pub source: usize,
+    /// Where the code is in its source, as fractions of its size: (x, y, width, height).
+    pub rect: (f32, f32, f32, f32),
+    /// The code with what's around it (labels, captions), outlined in its colour,
+    /// as (width, height, BGRA).
     pub thumb: Option<(u32, u32, Vec<u8>)>,
 }
 
@@ -37,47 +40,94 @@ impl Code {
     }
 }
 
+/// A searched picture (a monitor, or the clipboard image), shrunk for an overview
+/// on which each code is marked with its number.
+pub struct Source {
+    pub label: String,
+    pub preview: (u32, u32, Vec<u8>),
+}
+
+pub struct ScanOutput {
+    /// Only the pictures in which something was found.
+    pub sources: Vec<Source>,
+    pub codes: Vec<Code>,
+}
+
+/// Colours that tell results apart (result `n` uses `COLORS[n % len]`), as 0xRRGGBB.
+pub const COLORS: [u32; 8] = [0xE5484D, 0x3E63DD, 0x30A46C, 0xF76B15, 0x8E4EC6, 0x12A594, 0xD6409F, 0x978365];
+/// Width of the overview pictures.
+pub const PREVIEW_WIDTH: u32 = 516;
+
+/// A picture to search, as BGRA.
+struct Capture {
+    label: String,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
 /// Scan the clipboard image (if any) and every monitor; duplicates are dropped.
-pub fn scan_all() -> Vec<Code> {
-    let mut codes = Vec::new();
-    if let Some((luma, w, h)) = clipboard_image() {
-        codes.extend(decode(luma, w, h, "剪贴板图片"));
+pub fn scan_all() -> ScanOutput {
+    let mut captures = Vec::new();
+    if let Some(c) = clipboard_image() {
+        captures.push(c);
     }
     let screens = capture_monitors();
     let several = screens.len() > 1;
-    for (i, (luma, w, h)) in screens.into_iter().enumerate() {
-        let source = if several { format!("屏幕 {}", i + 1) } else { "屏幕".to_string() };
-        codes.extend(decode(luma, w, h, &source));
+    for (i, mut c) in screens.into_iter().enumerate() {
+        c.label = if several { format!("屏幕 {}", i + 1) } else { "屏幕".to_string() };
+        captures.push(c);
     }
-    // The same code twice (say on screen and copied too) is listed once.
-    let mut unique: Vec<Code> = Vec::new();
-    for code in codes {
-        if !unique.iter().any(|u| u.kind == code.kind && u.text == code.text) {
-            unique.push(code);
+    find(&captures)
+}
+
+fn find(captures: &[Capture]) -> ScanOutput {
+    // (capture, kind, text, box in pixels)
+    let mut found: Vec<(usize, String, String, (f32, f32, f32, f32))> = Vec::new();
+    for (ci, cap) in captures.iter().enumerate() {
+        let luma = bgra_to_luma(&cap.bgra);
+        let results = detect_multiple_in_luma(luma.clone(), cap.width, cap.height).unwrap_or_default();
+        for r in results {
+            let text = r.getText().to_string();
+            let kind = kind_name(r.getBarcodeFormat());
+            // The same code twice (say on screen and copied too) is listed once.
+            if text.trim().is_empty() || found.iter().any(|f| f.1 == kind && f.2 == text) {
+                continue;
+            }
+            if let Some(b) = code_box(&luma, cap.width, cap.height, r.getPoints()) {
+                found.push((ci, kind, text, b));
+            }
         }
     }
-    unique
-}
-
-fn decode(luma: Vec<u8>, width: u32, height: u32, source: &str) -> Vec<Code> {
-    // The reader takes the pixels; keep a copy to cut the thumbnails from.
-    let pixels = luma.clone();
-    detect_multiple_in_luma(luma, width, height)
-        .unwrap_or_default()
+    let mut used: Vec<usize> = found.iter().map(|f| f.0).collect();
+    used.sort();
+    used.dedup();
+    let sources = used
+        .iter()
+        .map(|&ci| Source { label: captures[ci].label.clone(), preview: preview(&captures[ci]) })
+        .collect();
+    let codes = found
         .into_iter()
-        .filter(|r| !r.getText().trim().is_empty())
-        .map(|r| Code {
-            kind: kind_name(r.getBarcodeFormat()),
-            text: r.getText().to_string(),
-            source: source.to_string(),
-            thumb: thumbnail(&pixels, width, height, r.getPoints()),
+        .enumerate()
+        .map(|(n, (ci, kind, text, (x0, y0, x1, y1)))| {
+            let cap = &captures[ci];
+            let (w, h) = (cap.width as f32, cap.height as f32);
+            Code {
+                kind,
+                text,
+                source: used.iter().position(|&u| u == ci).unwrap_or(0),
+                rect: (x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h),
+                thumb: context(cap, (x0, y0, x1, y1), COLORS[n % COLORS.len()]),
+            }
         })
-        .collect()
+        .collect();
+    ScanOutput { sources, codes }
 }
 
-/// Cut the code out of the image around the points the reader reported (finder
-/// pattern centres for 2D codes, the scan line for barcodes) and shrink it.
-fn thumbnail(luma: &[u8], width: u32, height: u32, points: &[Point]) -> Option<(u32, u32, Vec<u8>)> {
+/// The code's box in pixels, from the points the reader reported: finder pattern
+/// centres for 2D codes (widened to the corners), a scan line for barcodes (whose
+/// bars are followed up and down).
+fn code_box(luma: &[u8], width: u32, height: u32, points: &[Point]) -> Option<(f32, f32, f32, f32)> {
     if points.is_empty() {
         return None;
     }
@@ -90,33 +140,58 @@ fn thumbnail(luma: &[u8], width: u32, height: u32, points: &[Point]) -> Option<(
     }
     let (w, h) = (x1 - x0, y1 - y0);
     let (x0, y0, x1, y1) = if h < w * 0.2 {
-        // A barcode is reported as one scan line: follow its bars up and down.
         let (top, bottom) = bar_extent(luma, width, height, x0, x1, (y0 + y1) / 2.);
-        let pad = 10. + w * 0.04;
-        (x0 - pad, top - 8., x1 + pad, bottom + 8.)
+        let pad = 4. + w * 0.03;
+        (x0 - pad, top - 4., x1 + pad, bottom + 4.)
     } else {
-        // Finder pattern centres sit inside the code; widen by a share of its size.
-        let pad = w.max(h) * 0.25 + 6.;
+        let pad = w.max(h) * 0.22 + 4.;
         (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
     };
-    let x0 = x0.max(0.) as u32;
-    let y0 = y0.max(0.) as u32;
-    let x1 = (x1.min(width as f32) as u32).max(x0 + 1);
-    let y1 = (y1.min(height as f32) as u32).max(y0 + 1);
-    let (cw, ch) = (x1 - x0, y1 - y0);
-    let mut crop = image::GrayImage::new(cw, ch);
+    Some((x0.max(0.), y0.max(0.), x1.min(width as f32), y1.min(height as f32)))
+}
+
+/// The code and what's around it, with the code outlined in `color`, fit within 160 x 110.
+fn context(cap: &Capture, (x0, y0, x1, y1): (f32, f32, f32, f32), color: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let margin = (x1 - x0).max(y1 - y0) * 0.9 + 16.;
+    let cx0 = (x0 - margin).max(0.) as u32;
+    let cy0 = (y0 - margin).max(0.) as u32;
+    let cx1 = ((x1 + margin).min(cap.width as f32) as u32).max(cx0 + 1);
+    let cy1 = ((y1 + margin).min(cap.height as f32) as u32).max(cy0 + 1);
+    let (cw, ch) = (cx1 - cx0, cy1 - cy0);
+    let mut crop = image::RgbaImage::new(cw, ch);
     for y in 0..ch {
-        let row = ((y0 + y) * width + x0) as usize;
-        for x in 0..cw {
-            crop.put_pixel(x, y, image::Luma([*luma.get(row + x as usize)?]));
+        let start = (((cy0 + y) * cap.width + cx0) * 4) as usize;
+        let row = cap.bgra.get(start..start + cw as usize * 4)?;
+        for (x, px) in row.chunks_exact(4).enumerate() {
+            crop.put_pixel(x as u32, y, image::Rgba([px[0], px[1], px[2], 255]));
         }
     }
-    // Fit within 120 x 88.
-    let scale = (120. / cw as f32).min(88. / ch as f32).min(1.);
+    // Outline, thick enough to stay visible once shrunk.
+    let scale = (160. / cw as f32).min(110. / ch as f32).min(1.);
+    let t = ((2.5 / scale).ceil() as u32).max(2);
+    let bgra = [(color & 0xFF) as u8, ((color >> 8) & 0xFF) as u8, ((color >> 16) & 0xFF) as u8, 255];
+    let (bx0, by0) = ((x0 as u32).saturating_sub(cx0), (y0 as u32).saturating_sub(cy0));
+    let (bx1, by1) = (((x1 as u32).saturating_sub(cx0)).min(cw - 1), ((y1 as u32).saturating_sub(cy0)).min(ch - 1));
+    for y in by0..=by1 {
+        for x in bx0..=bx1 {
+            let edge = x < bx0 + t || x + t > bx1 || y < by0 + t || y + t > by1;
+            if edge {
+                crop.put_pixel(x, y, image::Rgba(bgra));
+            }
+        }
+    }
     let (tw, th) = (((cw as f32 * scale) as u32).max(1), ((ch as f32 * scale) as u32).max(1));
     let small = image::imageops::resize(&crop, tw, th, image::imageops::FilterType::Triangle);
-    let bgra = small.pixels().flat_map(|p| [p.0[0], p.0[0], p.0[0], 255]).collect();
-    Some((tw, th, bgra))
+    Some((tw, th, small.into_raw()))
+}
+
+/// The whole picture, [`PREVIEW_WIDTH`] wide.
+fn preview(cap: &Capture) -> (u32, u32, Vec<u8>) {
+    let full = image::RgbaImage::from_raw(cap.width, cap.height, cap.bgra.clone()).unwrap_or_default();
+    let w = PREVIEW_WIDTH.min(cap.width.max(1));
+    let h = ((cap.height as f32 * w as f32 / cap.width.max(1) as f32) as u32).max(1);
+    let small = image::imageops::resize(&full, w, h, image::imageops::FilterType::Triangle);
+    (w, h, small.into_raw())
 }
 
 fn kind_name(format: &BarcodeFormat) -> String {
@@ -176,8 +251,8 @@ fn bar_extent(luma: &[u8], width: u32, height: u32, x0: f32, x1: f32, y: f32) ->
 // ---------------------------------------------------------------------------
 // Screen
 
-/// Each monitor as a grey-scale image (physical pixels).
-fn capture_monitors() -> Vec<(Vec<u8>, u32, u32)> {
+/// Each monitor as a picture (physical pixels).
+fn capture_monitors() -> Vec<Capture> {
     unsafe extern "system" fn collect(_: HMONITOR, _: HDC, rect: *mut RECT, out: LPARAM) -> BOOL {
         let list = unsafe { &mut *(out.0 as *mut Vec<RECT>) };
         list.push(unsafe { *rect });
@@ -190,7 +265,7 @@ fn capture_monitors() -> Vec<(Vec<u8>, u32, u32)> {
     rects.into_iter().filter_map(capture_rect).collect()
 }
 
-fn capture_rect(r: RECT) -> Option<(Vec<u8>, u32, u32)> {
+fn capture_rect(r: RECT) -> Option<Capture> {
     let (w, h) = ((r.right - r.left).max(0), (r.bottom - r.top).max(0));
     if w == 0 || h == 0 {
         return None;
@@ -217,10 +292,15 @@ fn capture_rect(r: RECT) -> Option<(Vec<u8>, u32, u32)> {
                 let old = SelectObject(mem, bitmap.into());
                 let copied = BitBlt(mem, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY | CAPTUREBLT).is_ok();
                 let pixels = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
-                let luma = copied.then(|| bgra_to_luma(pixels));
+                let bgra = copied.then(|| {
+                    // A screen capture leaves alpha at 0: make it opaque.
+                    let mut bgra = pixels.to_vec();
+                    bgra.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+                    bgra
+                });
                 SelectObject(mem, old);
                 let _ = DeleteObject(bitmap.into());
-                luma.map(|l| (l, w as u32, h as u32))
+                bgra.map(|bgra| Capture { label: String::new(), width: w as u32, height: h as u32, bgra })
             }
             _ => None,
         };
@@ -241,7 +321,7 @@ fn bgra_to_luma(pixels: &[u8]) -> Vec<u8> {
 // Clipboard
 
 /// The clipboard's image, if it has one: PNG when offered, else the bitmap (DIB).
-fn clipboard_image() -> Option<(Vec<u8>, u32, u32)> {
+fn clipboard_image() -> Option<Capture> {
     let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     let (bytes, is_png) = unsafe {
         OpenClipboard(None).ok()?;
@@ -270,9 +350,18 @@ fn clipboard_image() -> Option<(Vec<u8>, u32, u32)> {
     } else {
         image::load_from_memory_with_format(&dib_to_bmp(&bytes)?, image::ImageFormat::Bmp).ok()?
     };
-    let grey = image.to_luma8();
-    let (w, h) = grey.dimensions();
-    Some((grey.into_raw(), w, h))
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    // BGRA, with transparent parts on white (as an image viewer would show them).
+    let bgra = rgba
+        .pixels()
+        .flat_map(|p| {
+            let [r, g, b, a] = p.0;
+            let over = |c: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+            [over(b), over(g), over(r), 255]
+        })
+        .collect();
+    Some(Capture { label: "剪贴板图片".into(), width, height, bgra })
 }
 
 /// A clipboard DIB is a BMP file without its 14-byte file header; put one in front.
@@ -302,43 +391,51 @@ fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Draw `contents` as `format` (with a white margin) and decode it again.
-    fn round_trip(contents: &str, format: BarcodeFormat, w: i32, h: i32) -> Vec<Code> {
+    /// Draw `contents` as `format` (with a white margin) and scan it.
+    fn round_trip(contents: &str, format: BarcodeFormat, w: i32, h: i32) -> ScanOutput {
         use rxing::Writer;
         let matrix = rxing::MultiFormatWriter.encode(contents, &format, w, h).unwrap();
         let (mw, mh) = (matrix.getWidth(), matrix.getHeight());
-        let pad = 20u32;
+        let pad = 60u32;
         let (iw, ih) = (mw + pad * 2, mh + pad * 2);
-        let mut luma = vec![255u8; (iw * ih) as usize];
+        let mut bgra = vec![255u8; (iw * ih * 4) as usize];
         for y in 0..mh {
             for x in 0..mw {
                 if matrix.get(x, y) {
-                    luma[((y + pad) * iw + x + pad) as usize] = 0;
+                    let i = (((y + pad) * iw + x + pad) * 4) as usize;
+                    bgra[i..i + 3].copy_from_slice(&[0, 0, 0]);
                 }
             }
         }
-        decode(luma, iw, ih, "测试")
+        find(&[Capture { label: "测试".into(), width: iw, height: ih, bgra }])
     }
 
     #[test]
     fn decodes_qr_codes_and_barcodes() {
-        let qr = round_trip("https://github.com/LovelyTeams/LovelyLauncher 你好", BarcodeFormat::QR_CODE, 240, 240);
-        assert_eq!(qr.len(), 1);
-        assert_eq!(qr[0].kind, "二维码");
-        // The thumbnail is the code, not the whole picture: mostly black and white.
-        let (tw, th, px) = qr[0].thumb.clone().unwrap();
-        assert!(tw > 20 && th > 20 && tw <= 120 && th <= 88);
-        let dark = px.chunks(4).filter(|p| p[0] < 128).count();
-        assert!(dark * 5 > px.len() / 4, "thumbnail should contain the code");
-        assert_eq!(qr[0].text, "https://github.com/LovelyTeams/LovelyLauncher 你好");
-        assert!(qr[0].is_link());
+        let out = round_trip("https://github.com/LovelyTeams/LovelyLauncher 你好", BarcodeFormat::QR_CODE, 240, 240);
+        assert_eq!(out.codes.len(), 1);
+        assert_eq!(out.sources.len(), 1);
+        let qr = &out.codes[0];
+        assert_eq!(qr.kind, "二维码");
+        assert_eq!(qr.text, "https://github.com/LovelyTeams/LovelyLauncher 你好");
+        assert!(qr.is_link());
+        // Its box sits around the middle of the picture, where the code was drawn.
+        let (x, y, w, h) = qr.rect;
+        assert!(x > 0.05 && y > 0.05 && x + w < 0.95 && y + h < 0.95, "{:?}", qr.rect);
+        // The thumbnail shows the code with its surroundings and the coloured outline.
+        let (tw, th, px) = qr.thumb.clone().unwrap();
+        assert!(tw <= 160 && th <= 110);
+        let red = px.chunks(4).filter(|p| p[2] > 180 && p[1] < 120 && p[0] < 120).count();
+        assert!(red > 0, "outline in the first colour");
 
         let ean = round_trip("5901234123457", BarcodeFormat::EAN_13, 300, 120);
-        assert_eq!(ean.len(), 1);
-        assert_eq!(ean[0].text, "5901234123457");
-        assert_eq!(ean[0].kind, "条形码（EAN-13）");
-        let (tw, th, _) = ean[0].thumb.clone().unwrap();
-        assert!(tw > th, "a barcode thumbnail is wide: {tw}x{th}");
+        assert_eq!(ean.codes.len(), 1);
+        assert_eq!(ean.codes[0].text, "5901234123457");
+        assert_eq!(ean.codes[0].kind, "条形码（EAN-13）");
+        // In pixels (the picture isn't square): wider than tall.
+        let (_, _, w, h) = ean.codes[0].rect;
+        let (pw, ph, _) = &ean.sources[0].preview;
+        assert!(w * *pw as f32 > h * *ph as f32, "a barcode's box is wide: {:?}", ean.codes[0].rect);
     }
 
     #[test]

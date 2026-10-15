@@ -27,24 +27,32 @@ pub enum Dialog {
 /// What 快速扫码 found.
 pub struct ScanResults {
     codes: Vec<crate::scan::Code>,
-    /// Each code's picture, so it is clear which text came from which code.
+    /// Each code with its surroundings, outlined in its colour.
     thumbs: Vec<Option<std::sync::Arc<gpui::RenderImage>>>,
+    /// Overviews of the screens / clipboard image, on which the codes are numbered:
+    /// (label, picture, width, height).
+    sources: Vec<(String, Option<std::sync::Arc<gpui::RenderImage>>, u32, u32)>,
     /// Which result was last copied.
     copied: Option<usize>,
     focus: FocusHandle,
 }
 
 impl ScanResults {
-    pub fn new(codes: Vec<crate::scan::Code>, copied: Option<usize>, focus: FocusHandle) -> Self {
-        let thumbs = codes
-            .iter()
-            .map(|c| {
-                let (w, h, px) = c.thumb.clone()?;
-                let img = image::RgbaImage::from_raw(w, h, px)?;
-                Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(img)])))
+    pub fn new(output: crate::scan::ScanOutput, copied: Option<usize>, focus: FocusHandle) -> Self {
+        let picture = |(w, h, px): (u32, u32, Vec<u8>)| {
+            let img = image::RgbaImage::from_raw(w, h, px)?;
+            Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(img)])))
+        };
+        let thumbs = output.codes.iter().map(|c| c.thumb.clone().and_then(picture)).collect();
+        let sources = output
+            .sources
+            .into_iter()
+            .map(|s| {
+                let (w, h) = (s.preview.0, s.preview.1);
+                (s.label, picture(s.preview), w, h)
             })
             .collect();
-        Self { codes, thumbs, copied, focus }
+        Self { codes: output.codes, thumbs, sources, copied, focus }
     }
 }
 
@@ -221,6 +229,11 @@ fn switch(id: impl Into<gpui::ElementId>, on: bool, theme: &Theme) -> Stateful<D
                     spread_radius: px(0.),
                 }]),
         )
+}
+
+/// The colour of scan result `n`.
+fn code_color(n: usize) -> gpui::Hsla {
+    gpui::rgb(crate::scan::COLORS[n % crate::scan::COLORS.len()]).into()
 }
 
 /// Drag payload of a settings slider (its element id).
@@ -1093,6 +1106,56 @@ impl Launcher {
                 )
                 .into_any_element();
         }
+        let badge = |n: usize, size: f32| {
+            div()
+                .flex_none()
+                .size(px(size))
+                .rounded_full()
+                .bg(code_color(n))
+                .text_color(gpui::white())
+                .text_size(px(size * 0.6))
+                .font_weight(FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child((n + 1).to_string())
+        };
+        // Where each code is: the searched picture, with numbered boxes on it.
+        let overviews = results.sources.iter().enumerate().map(|(si, (label, picture, w, h))| {
+            // Fit within the dialog's width and 200 px of height.
+            let aspect = *w as f32 / (*h).max(1) as f32;
+            let shown_w = (crate::scan::PREVIEW_WIDTH as f32).min(200. * aspect);
+            let shown_h = shown_w / aspect;
+            let marks = results.codes.iter().enumerate().filter(|(_, c)| c.source == si).map(|(n, c)| {
+                let (x, y, cw, ch) = c.rect;
+                div()
+                    .absolute()
+                    .left(px(x * shown_w - 2.))
+                    .top(px(y * shown_h - 2.))
+                    .w(px((cw * shown_w).max(10.) + 4.))
+                    .h(px((ch * shown_h).max(10.) + 4.))
+                    .rounded(px(4.))
+                    .border_2()
+                    .border_color(code_color(n))
+                    .child(badge(n, 18.).absolute().top(px(-9.)).left(px(-9.)))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().text_size(px(12.)).text_color(theme.text_faint).child(format!("{label}上的位置")))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(shown_w))
+                        .h(px(shown_h))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .children(picture.clone().map(|p| gpui::img(p).size_full().rounded(px(8.))))
+                        .children(marks),
+                )
+        });
         let rows = results.codes.iter().enumerate().map(|(ix, code)| {
             let copied = results.copied == Some(ix);
             let text = code.text.clone();
@@ -1123,12 +1186,13 @@ impl Launcher {
                 .bg(theme.panel)
                 .flex()
                 .gap(px(12.))
-                // The code itself, to match the text to it.
+                .child(badge(ix, 22.))
+                // The code with what's around it, outlined in its colour.
                 .child(
                     div()
                         .flex_none()
-                        .w(px(96.))
-                        .h(px(88.))
+                        .w(px(164.))
+                        .h(px(114.))
                         .rounded(px(8.))
                         .border_1()
                         .border_color(theme.border)
@@ -1137,7 +1201,7 @@ impl Launcher {
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .children(thumb.map(|t| gpui::img(t).max_w(px(92.)).max_h(px(84.)).object_fit(gpui::ObjectFit::Contain))),
+                        .children(thumb.map(|t| gpui::img(t).max_w(px(160.)).max_h(px(110.)).object_fit(gpui::ObjectFit::Contain))),
                 )
                 .child(
                     div()
@@ -1161,7 +1225,10 @@ impl Launcher {
                                 .text_size(px(11.5))
                                 .child(code.kind.clone()),
                         )
-                        .child(div().text_size(px(11.5)).text_color(theme.text_faint).child(format!("来自{}", code.source)))
+                        .child(div().text_size(px(11.5)).text_color(theme.text_faint).child(format!(
+                            "来自{}",
+                            results.sources.get(code.source).map(|s| s.0.as_str()).unwrap_or("")
+                        )))
                         .child(div().flex_1())
                         .when_some(link, |d, url| {
                             d.child(small_button(("scan-open", ix), "打开链接".into(), "external", false).on_click(cx.listener(
@@ -1191,8 +1258,9 @@ impl Launcher {
             .pb(px(6.))
             .child(div().text_size(px(12.5)).text_color(theme.text_faint).child(match results.copied {
                 Some(_) if results.codes.len() == 1 => "找到 1 个码，内容已复制到剪贴板".to_string(),
-                _ => format!("找到 {} 个码", results.codes.len()),
+                _ => format!("找到 {} 个码，编号和颜色与下方结果一一对应", results.codes.len()),
             }))
+            .children(overviews)
             .children(rows)
             .into_any_element()
     }

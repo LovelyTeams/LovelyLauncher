@@ -2056,16 +2056,16 @@ impl Launcher {
         .detach();
     }
 
-    fn show_scan_results(&mut self, codes: Vec<crate::scan::Code>, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_scan_results(&mut self, output: crate::scan::ScanOutput, window: &mut Window, cx: &mut Context<Self>) {
         // Dialogs need the full window.
         self.restore_full(cx);
         // A single result is what was wanted almost every time: copy it straight away.
-        let copied = (codes.len() == 1).then(|| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(codes[0].text.clone()));
+        let copied = (output.codes.len() == 1).then(|| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(output.codes[0].text.clone()));
             0
         });
         let focus = cx.focus_handle();
-        self.dialog = Some(crate::dialogs::Dialog::Scan(crate::dialogs::ScanResults::new(codes, copied, focus.clone())));
+        self.dialog = Some(crate::dialogs::Dialog::Scan(crate::dialogs::ScanResults::new(output, copied, focus.clone())));
         self.show(window, cx);
         window.focus(&focus);
         cx.notify();
