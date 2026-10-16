@@ -1,6 +1,6 @@
 [package]
 name = "lovely-launcher"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "LovelyLauncher - a lightweight, fast tool launcher built with GPUI"
 
