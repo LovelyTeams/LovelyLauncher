@@ -63,7 +63,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn for_viewport(width: f32, height: f32, favorites: usize) -> Self {
+    pub fn for_viewport(width: f32, height: f32, favorites: usize, settings: &crate::config::Settings) -> Self {
         let mut m = Self::base(width, height);
         m.fav_tiles = favorites > m.cols as usize;
         let fav_rows = favorites.div_ceil(m.tile_cols as usize).clamp(1, 2) as f32;
@@ -72,12 +72,18 @@ impl Metrics {
         // give the grid as many whole rows as fit and the rest to the bottom panels.
         const HEADER: f32 = 22.;
         const TABS: f32 = 28.;
-        let avail = height - m.titlebar - m.search_h - m.search_pb - 3. * m.section_gap;
-        let fav_block = HEADER + m.header_gap + if m.fav_tiles { m.fav_grid_h } else { m.fav_h };
+        let bottom_count = [settings.show_recent, settings.show_projects, settings.show_actions].into_iter().filter(|on| *on).count();
+        m.bottom_cols = m.bottom_cols.min(bottom_count.max(1) as u16);
+        let sections = 1 + usize::from(settings.show_favorites) + usize::from(bottom_count > 0);
+        let avail = height - m.titlebar - m.search_h - m.search_pb - sections as f32 * m.section_gap;
+        let fav_block = if settings.show_favorites { HEADER + m.header_gap + if m.fav_tiles { m.fav_grid_h } else { m.fav_h } } else { 0. };
         let tools_fixed = HEADER + TABS + 2. * m.header_gap;
-        // Always two rows of tiles; the rest scrolls inside the grid.
-        const ROWS: f32 = 2.;
-        m.grid_h = ROWS * m.tile_h + (ROWS - 1.) * m.grid_gap;
+        // Reclaim hidden sections for whole tool rows; keep the default layout.
+        let rows = if settings.show_favorites && bottom_count > 0 { 2. } else {
+            let bottom = if bottom_count > 0 { m.bottom_min } else { 0. };
+            ((avail - fav_block - tools_fixed - bottom + m.grid_gap) / (m.tile_h + m.grid_gap)).floor().max(2.)
+        };
+        m.grid_h = rows * m.tile_h + (rows - 1.) * m.grid_gap;
         let bottom_h = (avail - fav_block - tools_fixed - m.grid_h).max(m.bottom_min);
         m.recent_rows = ((bottom_h - 52.) / m.row_h).floor().clamp(2., 8.) as usize;
         m
@@ -127,7 +133,7 @@ impl Metrics {
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::for_viewport(1040., 800., 0)
+        Self::for_viewport(1040., 800., 0, &crate::config::Settings::default())
     }
 }
 
@@ -533,7 +539,12 @@ impl Launcher {
 
     fn render_dashboard(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let m = self.metrics;
-        let favorites: Vec<crate::config::Tool> = self.config.favorites().into_iter().cloned().collect();
+        let show_favorites = self.config.settings.show_favorites;
+        let show_recent = self.config.settings.show_recent;
+        let show_projects = self.config.settings.show_projects;
+        let show_actions = self.config.settings.show_actions;
+        let has_bottom = show_recent || show_projects || show_actions;
+        let favorites: Vec<crate::config::Tool> = if show_favorites { self.config.favorites().into_iter().cloned().collect() } else { Vec::new() };
 
         // Favourites: big cards while they fit in one row, square tiles beyond that.
         let mut fav_cards = Vec::new();
@@ -679,9 +690,9 @@ impl Launcher {
             .grid()
             .grid_cols(m.bottom_cols)
             .gap(px(m.grid_gap))
-            .child(self.render_recent_panel(theme, cx))
-            .child(self.render_projects_panel(theme, cx))
-            .child(self.render_actions_panel(theme, cx));
+            .when(show_recent, |d| d.child(self.render_recent_panel(theme, cx)))
+            .when(show_projects, |d| d.child(self.render_projects_panel(theme, cx)))
+            .when(show_actions, |d| d.child(self.render_actions_panel(theme, cx)));
 
         div()
             .id("dashboard")
@@ -695,9 +706,9 @@ impl Launcher {
             .flex_col()
             .gap(px(m.section_gap))
             .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(Theme::get(cx).accent_soft))
-            .child(favorites_section.flex_none())
+            .when(show_favorites, |d| d.child(favorites_section.flex_none()))
             .child(tools_section)
-            .child(bottom.flex_1().min_h(px(m.bottom_min)))
+            .when(has_bottom, |d| d.child(bottom.flex_1().min_h(px(m.bottom_min))))
     }
 
     /// A square tool tile (icon over name). Dropping another tile on it moves that
@@ -2075,7 +2086,7 @@ impl Render for Launcher {
         let theme = Theme::get(cx).clone();
         let viewport = window.viewport_size();
         let favorites = self.config.tools.iter().filter(|t| t.favorite).count();
-        self.metrics = Metrics::for_viewport(viewport.width.into(), viewport.height.into(), favorites);
+        self.metrics = Metrics::for_viewport(viewport.width.into(), viewport.height.into(), favorites, &self.config.settings);
         let searching = !self.search_text.trim().is_empty();
 
         let content = if self.mini {

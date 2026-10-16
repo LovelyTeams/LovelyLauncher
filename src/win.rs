@@ -822,6 +822,41 @@ pub fn scan_start_menu() -> Vec<InstalledApp> {
     apps
 }
 
+/// Shell namespace icons (Store/MSIX applications), using their original identity.
+pub fn shell_item_name(target: &str) -> Option<String> {
+    use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::{IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY}};
+    init_com();
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(target), None).ok()?;
+        let value = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let name = value.to_string().ok();
+        CoTaskMemFree(Some(value.0.cast()));
+        name
+    }
+}
+
+/// Localized name used by a pinned .lnk, retaining the original shortcut target.
+pub fn shortcut_name(path: &Path) -> Option<String> {
+    init_com();
+    display_name(path)
+}
+
+/// Shell namespace icons (Store/MSIX applications), using their original identity.
+pub fn app_icon(target: &str) -> Option<IconBitmap> {
+    use windows::Win32::{Foundation::SIZE, UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY}};
+    init_com();
+    unsafe {
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(target), None).ok()?;
+        let bitmap = factory.GetImage(SIZE { cx: 48, cy: 48 }, SIIGBF_ICONONLY).ok()?;
+        let result = (|| {
+            let (w, h) = bitmap_size(bitmap)?;
+            Some(IconBitmap { width: w as u32, height: h as u32, bgra: read_bits(bitmap, w, h)? })
+        })();
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        result
+    }
+}
+
 fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     if depth > 4 {
         return;
