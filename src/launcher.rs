@@ -896,6 +896,10 @@ impl Launcher {
             target.to_string()
         };
         self.cached_icon(target.to_string(), cx, move || {
+            if resolved.to_ascii_lowercase().starts_with("shell:appsfolder\\") {
+                let b = win::app_icon(&resolved)?;
+                return image::RgbaImage::from_raw(b.width, b.height, b.bgra);
+            }
             // For a command line, the program's own icon.
             let path = win::resolve_target_path(&resolved)
                 .or_else(|| win::split_command(&resolved).and_then(|(program, _)| win::resolve_target_path(&program)))?;

@@ -19,6 +19,7 @@ mod ring;
 mod scan;
 mod search;
 mod system;
+mod start_menu;
 mod theme;
 mod update;
 mod view;
