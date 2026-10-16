@@ -22,6 +22,27 @@ pub enum Dialog {
     Settings(SettingsEditor),
     Category(CategoryEditor),
     Scan(ScanResults),
+    StartMenu(StartMenuImport),
+}
+
+pub struct StartMenuImport {
+    entries: Vec<crate::start_menu::ImportEntry>,
+    query: Entity<TextInput>,
+    category: Entity<TextInput>,
+    error: Option<String>,
+    warning: Option<String>,
+    loading: bool,
+    focus: FocusHandle,
+    _subscription: Subscription,
+}
+
+impl StartMenuImport {
+    fn visible(&self, cx: &Context<Launcher>) -> Vec<usize> {
+        let query = self.query.read(cx).text().trim().to_lowercase();
+        self.entries.iter().enumerate().filter(|(_, e)| {
+            e.key.score(&query).is_some()
+        }).map(|(i, _)| i).collect()
+    }
 }
 
 /// What 快速扫码 found.
@@ -154,6 +175,7 @@ impl Dialog {
             },
             Dialog::Category(c) => vec![c.name.clone()],
             Dialog::Scan(_) => Vec::new(),
+            Dialog::StartMenu(s) => vec![s.query.clone(), s.category.clone()],
         }
     }
 
@@ -163,6 +185,7 @@ impl Dialog {
             Dialog::Settings(s) => &s.focus,
             Dialog::Category(c) => &c.focus,
             Dialog::Scan(s) => &s.focus,
+            Dialog::StartMenu(s) => &s.focus,
         }
     }
 }
@@ -313,6 +336,67 @@ impl Launcher {
     // -----------------------------------------------------------------------
     // Opening / closing
 
+    pub fn open_start_menu_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.restore_full(cx);
+        let category = match self.dialog.as_ref() {
+            Some(Dialog::Tool(editor)) => editor.category.read(cx).text().trim().to_string(),
+            _ => match &self.tool_filter { ToolFilter::Category(c) => c.clone(), _ => String::new() },
+        };
+        let query = new_input(cx, "搜索应用名称，支持拼音 / 首字母", "");
+        let subscription = cx.subscribe(&query, |_, _, _: &InputEvent, cx| cx.notify());
+        let focus = cx.focus_handle();
+        self.dialog = Some(Dialog::StartMenu(StartMenuImport {
+            entries: Vec::new(), query: query.clone(), category: new_input(cx, "未分类（也可输入新分类）", &category),
+            error: None, warning: None, loading: true, focus, _subscription: subscription,
+        }));
+        window.focus(&query.focus_handle(cx));
+        // The input entity also identifies this dialog, so a closed or reopened
+        // picker cannot receive an older background scan's results.
+        cx.spawn(async move |this, cx| {
+            let scan = cx.background_spawn(async { crate::start_menu::scan_pinned() }).await;
+            this.update(cx, |this, cx| {
+                if let Some(Dialog::StartMenu(s)) = this.dialog.as_mut() {
+                    if s.query == query {
+                        match scan {
+                            Ok(scan) => {
+                                s.entries = crate::start_menu::entries(scan.apps, &this.config.tools);
+                                if !scan.warnings.is_empty() { s.warning = Some(scan.warnings.join("；")); }
+                            }
+                            Err(error) => s.error = Some(error),
+                        }
+                        s.loading = false;
+                        cx.notify();
+                    }
+                }
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    fn import_start_menu(&mut self, all_visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::StartMenu(s)) = self.dialog.as_ref() else { return; };
+        if s.loading { return; }
+        let visible = s.visible(cx);
+        let apps: Vec<_> = s.entries.iter().enumerate().filter(|(i, e)| {
+            !e.added && if all_visible { visible.contains(i) } else { e.selected }
+        }).map(|(_, e)| e.app.clone()).collect();
+        if apps.is_empty() { return; }
+        let category = s.category.read(cx).text().trim().to_string();
+        let mut config = self.config.clone();
+        let count = crate::start_menu::import(&mut config.tools, apps, &category);
+        if count > 0 && !category.is_empty() { config.add_category(&category); }
+        if let Err(err) = config.try_save() {
+            self.show_toast(format!("导入未保存，请重试：{err}"), true, cx);
+            return;
+        }
+        self.config = config;
+        self.tool_filter = if category.is_empty() { ToolFilter::All } else { ToolFilter::Category(category) };
+        self.close_dialog(window, cx);
+        self.refresh_results();
+        self.show_toast(format!("已导入 {count} 个应用，重复项目已跳过"), false, cx);
+    }
+
     pub fn open_tool_editor(&mut self, id: Option<String>, prefill: Option<Tool>, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         // Dialogs need the full window.
@@ -453,6 +537,7 @@ impl Launcher {
             Some(Dialog::Settings(_)) => self.save_settings(window, cx),
             Some(Dialog::Category(_)) => self.save_category(window, cx),
             Some(Dialog::Scan(_)) => self.close_dialog(window, cx),
+            Some(Dialog::StartMenu(_)) => self.import_start_menu(false, window, cx),
             None => {}
         }
     }
@@ -711,6 +796,91 @@ impl Launcher {
     // -----------------------------------------------------------------------
     // Rendering
 
+    fn render_start_menu(&self, s: &StartMenuImport, tiles: Vec<(usize, AnyElement)>, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let selected = s.entries.iter().filter(|e| e.selected && !e.added).count();
+        let rows = tiles.into_iter().map(|(i, tile)| {
+            let entry = &s.entries[i];
+            let checked = entry.added || entry.selected;
+            div().id(("start-menu-app", i)).h(px(54.)).flex_none().px(px(10.)).rounded(px(9.))
+                .flex().items_center().gap(px(10.)).text_size(px(13.))
+                .when(entry.selected && !entry.added, |d| d.bg(theme.accent_soft.opacity(0.45)))
+                .when(!entry.added, |d| d.cursor_pointer().hover(|s| s.bg(theme.row_hover)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(Dialog::StartMenu(s)) = this.dialog.as_mut() {
+                        if !s.entries[i].added { s.entries[i].selected = !s.entries[i].selected; }
+                    }
+                    cx.notify();
+                }))
+                .child(div().size(px(18.)).flex_none().rounded(px(5.)).border_1()
+                    .border_color(if checked { theme.accent } else { theme.border_strong })
+                    .when(checked, |d| d.bg(theme.accent))
+                    .flex().items_center().justify_center()
+                    .when(checked, |d| d.child(icon("check", 12., theme.accent_text))))
+                .child(tile)
+                .child(div().flex_1().min_w_0().flex().flex_col().gap(px(3.))
+                    .text_color(if entry.added { theme.text_muted } else { theme.text })
+                    .child(div().truncate().child(entry.app.name.clone()))
+                    .child(div().truncate().text_size(px(10.5)).text_color(theme.text_faint)
+                        .child(entry.app.path.to_string_lossy().into_owned())))
+                .when(entry.added, |d| d.child(div().text_size(px(11.)).text_color(theme.text_muted).child("已添加")))
+        }).collect::<Vec<_>>();
+        let visible_count = rows.len();
+        div().flex().flex_col().gap(px(12.))
+            .child(div().text_size(px(12.)).text_color(theme.text_muted).child("读取开始菜单“已固定”中的图标，保留固定顺序、原始快捷方式和图标。"))
+            .child(self.input_box(&s.query, theme, window, cx))
+            .when_some(s.warning.clone(), |d, warning| d.child(div().text_size(px(12.)).text_color(theme.danger).child(warning)))
+            .child(div().id("start-menu-list").h(px(270.)).flex_none().overflow_y_scroll().rounded(px(10.))
+                .border_1().border_color(theme.border).p(px(4.)).flex().flex_col().gap(px(2.))
+                .when(s.loading, |d| d.child(div().p(px(20.)).text_size(px(13.)).text_color(theme.text_muted).child("正在读取开始菜单已固定图标…")))
+                .when_some(s.error.clone(), |d, error| d.child(div().p(px(16.)).text_size(px(12.5)).text_color(theme.danger).child(error)))
+                .when(!s.loading && s.error.is_none() && visible_count == 0, |d| d.child(div().p(px(20.)).text_size(px(13.)).text_color(theme.text_muted).child("没有找到匹配的已固定图标")))
+                .children(rows))
+            .child(div().flex().items_center().gap(px(8.))
+                .child(button("start-menu-select-all", "全选", false, theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(Dialog::StartMenu(s)) = this.dialog.as_mut() {
+                        for i in s.visible(cx) { if !s.entries[i].added { s.entries[i].selected = true; } }
+                    }
+                    cx.notify();
+                })))
+                .child(button("start-menu-invert", "反选", false, theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(Dialog::StartMenu(s)) = this.dialog.as_mut() {
+                        for i in s.visible(cx) { if !s.entries[i].added { s.entries[i].selected = !s.entries[i].selected; } }
+                    }
+                    cx.notify();
+                })))
+                .child(div().flex_1().text_right().text_size(px(12.)).text_color(theme.text_muted)
+                    .child(format!("显示 {visible_count} / {} 个 · 已选择 {selected} 个", s.entries.len()))))
+            .child(div().child(label("导入到分类", theme)).child(self.input_box(&s.category, theme, window, cx)))
+            .child(div().flex().flex_wrap().gap(px(6.)).children(
+                std::iter::once(String::new()).chain(self.config.categories.iter().cloned()).enumerate().map(|(i, name)| {
+                    let active = s.category.read(cx).text().trim() == name;
+                    let input = s.category.clone();
+                    div().id(("start-menu-category", i)).px(px(9.)).py(px(4.)).rounded_full().text_size(px(11.5)).cursor_pointer()
+                        .bg(if active { theme.accent_soft } else { theme.kbd_bg })
+                        .text_color(if active { theme.accent } else { theme.text_muted })
+                        .child(if name.is_empty() { "未分类".to_string() } else { name.clone() })
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| { input.update(cx, |input, cx| input.set_text(name.clone(), cx)); cx.notify(); }))
+                })
+            )).into_any_element()
+    }
+
+    fn render_start_menu_footer(&self, s: &StartMenuImport, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let any = s.entries.iter().any(|e| !e.added && e.selected);
+        let any_visible = s.visible(cx).iter().any(|i| !s.entries[*i].added);
+        div().flex_none().px(px(22.)).py(px(16.)).flex().items_center().gap(px(8.))
+            .when(s.error.is_some(), |d| d.child(button("start-menu-retry", "重新读取", false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_start_menu_import(window, cx)))))
+            .child(button("start-menu-import-all", if s.query.read(cx).text().trim().is_empty() { "一键导入全部" } else { "导入搜索结果" }, false, theme)
+                .when(s.loading || !any_visible, |d| d.opacity(0.4).cursor_default())
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.import_start_menu(true, window, cx))))
+            .child(div().flex_1())
+            .child(button("start-menu-cancel", "取消", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_dialog(window, cx))))
+            .child(button("start-menu-import", "导入所选", true, theme)
+                .when(s.loading || !any, |d| d.opacity(0.4).cursor_default())
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.import_start_menu(false, window, cx))))
+            .into_any_element()
+    }
+
     pub(crate) fn render_dialog(&mut self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let preview = match self.dialog.as_ref()? {
             Dialog::Tool(editor) => {
@@ -724,11 +894,25 @@ impl Launcher {
                 let visual = Self::tool_visual(&draft);
                 Some(self.tile(&visual, 56., 28., theme, cx))
             }
-            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) => None,
+            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) => None,
         };
         let dialog = self.dialog.as_ref()?;
         let focus = dialog.focus_handle().clone();
+        // Build icon tiles before borrowing the dialog for the form.
+        let import_tiles = if let Dialog::StartMenu(s) = dialog {
+            s.visible(cx).into_iter().map(|i| (i, s.entries[i].app.path.to_string_lossy().into_owned())).collect::<Vec<_>>()
+        } else { Vec::new() };
+        let import_tiles = import_tiles.into_iter().map(|(i, target)| {
+            let visual = crate::launcher::Visual::File { target, tint: "pink".into(), fallback: "grid".into() };
+            (i, self.tile(&visual, 32., 18., theme, cx))
+        }).collect();
+        let dialog = self.dialog.as_ref()?;
         let (title, body, footer) = match dialog {
+            Dialog::StartMenu(s) => (
+                "导入开始菜单程序",
+                self.render_start_menu(s, import_tiles, theme, window, cx),
+                self.render_start_menu_footer(s, theme, cx),
+            ),
             Dialog::Tool(editor) => {
                 let title = if editor.id.is_some() { "编辑工具" } else { "添加工具" };
                 let form = self.render_tool_form(editor, preview, theme, window, cx);
@@ -785,7 +969,7 @@ impl Launcher {
                     .into_any_element(),
             ),
         };
-        let dialog_width = if matches!(dialog, Dialog::Category(_)) { 400. } else { 560. };
+        let dialog_width = if matches!(dialog, Dialog::Category(_)) { 400. } else if matches!(dialog, Dialog::StartMenu(_)) { 640. } else { 560. };
 
         let card_bg = if theme.dark { gpui::rgb(0x29232a) } else { gpui::rgb(0xfffbfc) };
         Some(
@@ -1083,6 +1267,11 @@ impl Launcher {
                     .child("切换输入框"),
             )
             .child(div().flex_1())
+            .when(matches!(self.dialog.as_ref(), Some(Dialog::Tool(editor)) if editor.id.is_none()), |d| {
+                d.child(button("import-start-menu", "导入开始菜单程序", false, theme).on_click(cx.listener(
+                    |this, _: &ClickEvent, window, cx| this.open_start_menu_import(window, cx),
+                )))
+            })
             .child(button("cancel", "取消", false, theme).on_click(cx.listener(
                 |this, _: &ClickEvent, window, cx| this.close_dialog(window, cx),
             )))
@@ -1738,6 +1927,26 @@ impl Launcher {
             .flex()
             .flex_col()
             .gap(px(12.))
+            .child(section("界面"))
+            .children([
+                ("show-favorites", "收藏工具", "在主界面显示收藏工具卡片", settings.show_favorites, 0),
+                ("show-recent", "最近使用", "在主界面显示最近使用卡片", settings.show_recent, 1),
+                ("show-projects", "最近项目", "在主界面显示最近项目卡片", settings.show_projects, 2),
+                ("show-actions", "快捷操作", "在主界面显示快捷操作卡片", settings.show_actions, 3),
+            ].into_iter().map(|(id, title, desc, on, index)| {
+                toggle(id, title, desc, on, theme).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    let settings = &mut this.config.settings;
+                    let value = match index {
+                        0 => &mut settings.show_favorites,
+                        1 => &mut settings.show_recent,
+                        2 => &mut settings.show_projects,
+                        _ => &mut settings.show_actions,
+                    };
+                    *value = !*value;
+                    this.config.save();
+                    cx.notify();
+                }))
+            }))
             .child(section("外观"))
             .child(
                 div()

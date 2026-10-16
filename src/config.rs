@@ -106,6 +106,11 @@ pub struct Settings {
     pub hide_on_blur: bool,
     pub hide_after_launch: bool,
     pub blur_background: bool,
+    /// Dashboard cards; missing fields in older configurations stay visible.
+    pub show_favorites: bool,
+    pub show_recent: bool,
+    pub show_projects: bool,
+    pub show_actions: bool,
     /// Terminal used for "新建终端" and "在终端中打开"; empty = auto-detect.
     pub terminal: String,
     /// Accent color as "#RRGGBB".
@@ -281,6 +286,10 @@ impl Default for Settings {
             hide_on_blur: false,
             hide_after_launch: true,
             blur_background: true,
+            show_favorites: true,
+            show_recent: true,
+            show_projects: true,
+            show_actions: true,
             terminal: String::new(),
             accent: DEFAULT_ACCENT.into(),
             tint_surfaces: true,
@@ -422,16 +431,18 @@ impl Config {
     }
 
     pub fn save(&self) {
+        let _ = self.try_save();
+    }
+
+    /// Import dialogs must report a write failure before committing the batch.
+    pub fn try_save(&self) -> Result<(), String> {
         let dir = Self::dir();
-        let _ = fs::create_dir_all(&dir);
-        let Ok(json) = serde_json::to_string_pretty(self) else {
-            return;
-        };
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         // Write-then-rename so a crash never leaves a truncated config behind.
         let tmp = dir.join("config.json.tmp");
-        if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, Self::path());
-        }
+        fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, Self::path()).map_err(|e| e.to_string())
     }
 
     /// Favourite tools in their own order; ones missing from it follow in tool order.
@@ -684,6 +695,25 @@ fn default_tools() -> Vec<Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_cards_default_visible_and_keep_saved_choices() {
+        let old: Settings = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        assert!(old.show_favorites && old.show_recent && old.show_projects && old.show_actions);
+        for mask in 0..16 {
+            let settings = Settings {
+                show_favorites: mask & 1 != 0,
+                show_recent: mask & 2 != 0,
+                show_projects: mask & 4 != 0,
+                show_actions: mask & 8 != 0,
+                ..Default::default()
+            };
+            let saved = serde_json::to_string(&settings).unwrap();
+            let loaded: Settings = serde_json::from_str(&saved).unwrap();
+            assert_eq!([loaded.show_favorites, loaded.show_recent, loaded.show_projects, loaded.show_actions],
+                [settings.show_favorites, settings.show_recent, settings.show_projects, settings.show_actions]);
+        }
+    }
 
     #[test]
     fn migrates_v2_categories() {

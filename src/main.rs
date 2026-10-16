@@ -20,6 +20,7 @@ mod scan;
 mod search;
 mod select;
 mod system;
+mod start_menu;
 mod theme;
 mod update;
 mod view;
