@@ -18,6 +18,7 @@ mod preview;
 mod ring;
 mod scan;
 mod search;
+mod select;
 mod system;
 mod theme;
 mod update;

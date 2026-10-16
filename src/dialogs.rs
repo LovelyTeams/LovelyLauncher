@@ -2257,7 +2257,7 @@ impl Launcher {
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .children(crate::markdown::render(&notes, None, theme)),
+                        .children(crate::markdown::render(&notes, None, None, theme)),
                 )
             })
             .into_any_element()

@@ -1461,7 +1461,7 @@ impl Launcher {
                     .into_any_element()
             }
             Some((text, state, _)) => {
-                let mut blocks = crate::markdown::render(text, None, theme);
+                let mut blocks = crate::markdown::render(text, None, None, theme);
                 if text.is_empty() && streaming {
                     blocks.push(
                         div()

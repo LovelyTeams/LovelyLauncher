@@ -21,8 +21,9 @@ use std::{
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight,
     HighlightStyle, Image, ImageFormat, KeyBinding, ListAlignment, ListHorizontalSizingBehavior,
-    ListOffset, ListState, MouseButton, MouseDownEvent, ObjectFit, Pixels, Render, RenderImage,
-    ScrollHandle, ScrollStrategy, SharedString, StrikethroughStyle, StyledImage, StyledText,
+    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render,
+    RenderImage, DispatchPhase, ClipboardItem,
+    ScrollHandle, ScrollStrategy, SharedString, StrikethroughStyle, StyledImage,
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, WindowControlArea, actions,
     canvas, div, img, list, prelude::*, px, uniform_list,
 };
@@ -33,6 +34,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use crate::{
     highlight,
     launcher::Launcher,
+    select::Selection,
     preview::{
         ffmpeg::FfmpegState,
         media::Player,
@@ -44,7 +46,7 @@ use crate::{
     win,
 };
 
-actions!(preview, [ClosePreview, TogglePlayback]);
+actions!(preview, [ClosePreview, TogglePlayback, CopySelection, SelectAllText]);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Preview");
@@ -52,6 +54,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", ClosePreview, ctx),
         KeyBinding::new("escape", ClosePreview, ctx),
         KeyBinding::new("k", TogglePlayback, ctx),
+        KeyBinding::new("ctrl-c", CopySelection, ctx),
+        KeyBinding::new("ctrl-a", SelectAllText, ctx),
     ]);
 }
 
@@ -306,12 +310,16 @@ pub struct Preview {
     bar_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Bumped on every load so stale background results are ignored.
     generation: u64,
+    /// Text selected with the mouse.
+    selection: Selection,
+    hwnd: Option<isize>,
 }
 
 impl Preview {
     pub fn new(
         path: PathBuf,
         anchor: Option<isize>,
+        size: (f32, f32),
         wrap: bool,
         launcher: WeakEntity<Launcher>,
         window: &mut Window,
@@ -344,13 +352,35 @@ impl Preview {
             frame_seq: 0,
             bar_bounds: Rc::new(Cell::new(Bounds::default())),
             generation: 0,
+            selection: Selection::default(),
+            hwnd,
         };
         window.focus(&this.focus);
         // Show without stealing focus from Explorer, so arrow keys keep working there.
         if let Some(raw) = hwnd {
-            let (w, h) = initial_size(kind);
+            let (w, h) = size;
             cx.spawn(async move |_, _| win::place_window(raw, w, h, anchor)).detach();
+            win::add_resize_grip(raw, GRIP as u32);
         }
+        // Remember a size the user picks (not the first placement, not maximized).
+        let opened = std::time::Instant::now();
+        let mut last = window.bounds().size;
+        cx.observe_window_bounds(window, move |this, window, cx| {
+            let size = window.bounds().size;
+            if window.is_maximized() || size == last || opened.elapsed() < Duration::from_millis(800) {
+                last = size;
+                return;
+            }
+            last = size;
+            let size = [f32::from(size.width).round(), f32::from(size.height).round()];
+            this.launcher
+                .update(cx, |launcher, cx| {
+                    launcher.config.settings.preview_size = Some(size);
+                    launcher.save_soon(cx);
+                })
+                .ok();
+        })
+        .detach();
         hook::PREVIEW_OPEN.store(true, Ordering::Relaxed);
         this.show_path(path, window, cx);
         this
@@ -370,6 +400,87 @@ impl Preview {
 
     fn close_action(&mut self, _: &ClosePreview, window: &mut Window, _: &mut Context<Self>) {
         self.close(window);
+    }
+
+    /// The selected text: rows of a text view come from the file itself (they
+    /// may be scrolled away); documents from what is on screen.
+    fn selected_text(&self) -> Option<String> {
+        let doc = match &self.content {
+            Content::Text { doc, .. } | Content::Html { source: doc, show_source: true, .. } => doc,
+            _ => return self.selection.text_from_pieces(),
+        };
+        let ((k1, o1), (k2, o2)) = self.selection.range()?;
+        let mut out = String::new();
+        for key in k1..=k2.min(doc.rows.len().saturating_sub(1)) {
+            let row = &doc.rows[key];
+            let text: &str = row.text.as_ref();
+            let start = if key == k1 { o1.min(text.len()) } else { 0 };
+            let end = if key == k2 { o2.min(text.len()) } else { text.len() };
+            if key != k1 && row.line.is_some() {
+                out.push('\n');
+            }
+            out.push_str(text.get(start..end.max(start)).unwrap_or(""));
+        }
+        Some(out)
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text().filter(|t| !t.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn copy_action(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+    }
+
+    fn select_all_action(&mut self, _: &SelectAllText, _: &mut Window, cx: &mut Context<Self>) {
+        let doc = match &self.content {
+            Content::Text { doc, .. } | Content::Html { source: doc, show_source: true, .. } => Some(doc.clone()),
+            _ => None,
+        };
+        match doc {
+            Some(doc) => {
+                if let Some(last) = doc.rows.len().checked_sub(1) {
+                    self.selection.set((0, 0), (last, doc.rows[last].text.len()));
+                }
+            }
+            None => self.selection.select_all_pieces(),
+        }
+        cx.notify();
+    }
+
+    /// Follows the mouse while text is being selected, wherever the pointer goes.
+    fn selection_tracker(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let sel = self.selection.clone();
+        let this = cx.entity().downgrade();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                if !sel.is_dragging() {
+                    return;
+                }
+                let (moving, view) = (sel.clone(), this.clone());
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        moving.release();
+                    } else if moving.drag(e.position) {
+                        view.update(cx, |_, cx| cx.notify()).ok();
+                    }
+                });
+                let released = sel.clone();
+                window.on_mouse_event(move |e: &MouseUpEvent, phase, _, _| {
+                    if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
+                        released.release();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
     }
 
     fn toggle_action(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
@@ -394,6 +505,7 @@ impl Preview {
         }
         self.generation += 1;
         let generation = self.generation;
+        self.selection.clear();
         self.path = path.clone();
         self.kind = kind_of(&path);
         self.content = Content::Loading;
@@ -656,6 +768,7 @@ impl Preview {
         if let Content::Text { doc, alt: Some(alt), formatted, list, scroll } = &mut self.content {
             std::mem::swap(doc, alt);
             *formatted = !*formatted;
+            self.selection.clear();
             list.reset(doc.rows.len());
             *scroll = UniformListScrollHandle::new();
             let flag = if *formatted { "已格式化" } else { "原文" };
@@ -707,6 +820,7 @@ impl Preview {
     fn toggle_html_source(&mut self, cx: &mut Context<Self>) {
         if let Content::Html { show_source, .. } = &mut self.content {
             *show_source = !*show_source;
+            self.selection.clear();
             cx.notify();
         }
     }
@@ -1081,12 +1195,26 @@ impl Preview {
                     )
                 },
             )
+            .when(self.selection.range().is_some(), |d| {
+                d.child(
+                    button("copy-selection", "copy", "复制", theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_selection(cx))),
+                )
+            })
             .child(button("open-default", "external", "打开", theme).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| this.open_default(cx),
             )))
             .child(button("reveal", "folder-open", "", theme).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| this.reveal(cx),
             )))
+            .when_some(self.hwnd, |d, raw| {
+                d.child(
+                    button("preview-max", "maximize", "", theme).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        // Not from inside the event: resizing re-enters the window.
+                        cx.spawn(async move |_, _| win::toggle_maximize(raw)).detach();
+                    })),
+                )
+            })
             .child(
                 div()
                     .id("preview-close")
@@ -1125,7 +1253,7 @@ impl Preview {
                 .child(img(self.path.clone()).size_full().object_fit(ObjectFit::Contain))
                 .into_any_element(),
             Content::Markdown(source) => {
-                let blocks = crate::markdown::render(source, self.path.parent(), theme);
+                let blocks = crate::markdown::render(source, self.path.parent(), Some(&self.selection), theme);
                 self.with_vertical_bar(
                     div()
                         .id("markdown")
@@ -1143,7 +1271,8 @@ impl Preview {
             Content::Pdf { doc, list, cache } => self.render_pdf(doc, list, cache, theme),
             Content::Html { source, show_source: true, list, scroll, .. } => self.render_text(source, list, scroll, theme),
             Content::Html { events, images, .. } => {
-                let blocks = crate::markdown::render_events(events.iter().cloned(), self.path.parent(), images, theme);
+                let blocks =
+                    crate::markdown::render_events(events.iter().cloned(), self.path.parent(), images, Some(&self.selection), theme);
                 self.with_vertical_bar(
                     div()
                         .id("html")
@@ -1161,7 +1290,7 @@ impl Preview {
                 let elements: Vec<AnyElement> = blocks
                     .iter()
                     .zip(images.iter())
-                    .map(|(block, image)| doc_block(block, image.clone(), theme))
+                    .map(|(block, image)| doc_block(block, image.clone(), &self.selection, theme))
                     .collect();
                 self.with_vertical_bar(
                     div()
@@ -1254,17 +1383,12 @@ impl Preview {
         let (rows, widest) = (doc.rows.len(), doc.widest);
         let surface = theme.surface;
         let sideways = scroll.0.borrow().base_handle.clone();
+        let (sel, selected) = (self.selection.clone(), theme.selection);
         let render_row = move |ix: usize| -> Div {
             let row = &doc.rows[ix];
-            let content: AnyElement = if !row.spans.is_empty() {
-                StyledText::new(row.text.clone())
-                    .with_highlights(highlight::styled(&row.spans, dark))
-                    .into_any_element()
-            } else if row.text.is_empty() {
-                " ".into_any_element()
-            } else {
-                row.text.clone().into_any_element()
-            };
+            // Continuation pieces of a long line join without a line break when copied.
+            let sep = if row.line.is_some() { "\n" } else { "" };
+            let content = sel.keyed_piece(ix, row.text.clone(), highlight::styled(&row.spans, dark), sep, selected);
             // The row moves left when scrolled sideways; shift the line number
             // back so it stays put, painted over the text that slides under it.
             let shift = if wrap { px(0.) } else { -sideways.offset().x };
@@ -1785,14 +1909,14 @@ fn centered(child: impl IntoElement) -> AnyElement {
     div().size_full().flex().items_center().justify_center().child(child).into_any_element()
 }
 
-fn doc_block(block: &DocBlock, image: Option<Arc<Image>>, theme: &Theme) -> AnyElement {
+fn doc_block(block: &DocBlock, image: Option<Arc<Image>>, sel: &Selection, theme: &Theme) -> AnyElement {
     match block {
         DocBlock::Paragraph { text, runs, heading, list_level } => {
             if text.trim().is_empty() {
                 return div().h(px(8.)).into_any_element();
             }
             let highlights: Vec<_> = runs.iter().map(|(r, s)| (r.clone(), run_style(*s, theme))).collect();
-            let styled = StyledText::new(text.clone()).with_highlights(highlights);
+            let styled = sel.piece(text.clone(), highlights, "\n", theme.selection);
             let (size, weight) = match heading {
                 1 => (22., FontWeight::BOLD),
                 2 => (18.5, FontWeight::BOLD),
@@ -1828,6 +1952,8 @@ fn doc_block(block: &DocBlock, image: Option<Arc<Image>>, theme: &Theme) -> AnyE
                 .border_color(theme.border)
                 .children(rows.iter().enumerate().flat_map(|(r, row)| {
                     (0..cols).map(move |c| {
+                        let cell = row.get(c).cloned().unwrap_or_default();
+                        let cell = sel.piece(cell, Vec::new(), if c == 0 { "\n" } else { "\t" }, theme.selection);
                         div()
                             .px(px(8.))
                             .py(px(5.))
@@ -1836,7 +1962,7 @@ fn doc_block(block: &DocBlock, image: Option<Arc<Image>>, theme: &Theme) -> AnyE
                             .border_color(theme.border)
                             .text_size(px(13.))
                             .when(r == 0, |d| d.bg(theme.kbd_bg).font_weight(FontWeight::SEMIBOLD))
-                            .child(row.get(c).cloned().unwrap_or_default())
+                            .child(cell)
                     })
                 }))
                 .into_any_element()
@@ -1857,31 +1983,69 @@ fn doc_block(block: &DocBlock, image: Option<Arc<Image>>, theme: &Theme) -> AnyE
     }
 }
 
+/// Size of the resize grip in the bottom-right corner (logical pixels).
+const GRIP: f32 = 16.;
+
+/// Little dots in the bottom-right corner, where the window can be resized.
+fn resize_grip(color: gpui::Hsla) -> impl IntoElement {
+    let dot = |right: f32, bottom: f32| {
+        div().absolute().right(px(right)).bottom(px(bottom)).size(px(2.)).rounded_full().bg(color.opacity(0.7))
+    };
+    div()
+        .absolute()
+        .right_0()
+        .bottom_0()
+        .size(px(GRIP))
+        .child(dot(3., 3.))
+        .child(dot(7., 3.))
+        .child(dot(11., 3.))
+        .child(dot(3., 7.))
+        .child(dot(7., 7.))
+        .child(dot(3., 11.))
+}
+
 impl Render for Preview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let header = self.render_header(&theme, cx);
+        self.selection.begin_frame(0);
         let body = self.render_body(&theme, cx);
+        let tracker = self.selection_tracker(cx);
         div()
             .key_context("Preview")
             .on_action(cx.listener(Self::close_action))
             .on_action(cx.listener(Self::toggle_action))
+            .on_action(cx.listener(Self::copy_action))
+            .on_action(cx.listener(Self::select_all_action))
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.surface)
             .text_color(theme.text)
             .text_size(px(14.))
+            .relative()
             .child(header)
             .child(
                 // Focus lives here rather than on the root so the header stays draggable.
                 div()
                     .id("preview-body")
                     .track_focus(&self.focus)
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(body),
+                    // Press and drag over text to select it.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                            this.selection.press(e.position, e.click_count);
+                            window.focus(&this.focus);
+                            cx.notify();
+                        }),
+                    )
+                    .child(body)
+                    .child(tracker),
             )
+            .child(resize_grip(theme.text_faint))
     }
 }
 

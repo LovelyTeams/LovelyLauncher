@@ -222,6 +222,52 @@ pub fn place_window(raw: isize, width: f32, height: f32, anchor: Option<isize>) 
     }
 }
 
+/// Maximize the window, or put it back if it is maximized.
+pub fn toggle_maximize(raw: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::ShowWindowAsync;
+    let h = hwnd(raw);
+    unsafe {
+        let _ = ShowWindowAsync(h, if IsZoomed(h).as_bool() { SW_RESTORE } else { SW_MAXIMIZE });
+    }
+}
+
+/// Make the bottom-right `size` × `size` (logical pixels) of the window a resize
+/// grip, on top of the thin edges Windows already offers.
+pub fn add_resize_grip(raw: isize, size: u32) {
+    use windows::Win32::{
+        Foundation::{LPARAM, LRESULT, RECT, WPARAM},
+        UI::{
+            HiDpi::GetDpiForWindow,
+            Shell::{DefSubclassProc, SetWindowSubclass},
+            WindowsAndMessaging::{DefWindowProcW, HTBOTTOMRIGHT, HTCLIENT, WM_NCHITTEST, WM_NCLBUTTONDOWN},
+        },
+    };
+    fn in_grip(h: HWND, l: LPARAM, size: usize) -> bool {
+        let mut rect = RECT::default();
+        if unsafe { IsZoomed(h).as_bool() || GetWindowRect(h, &mut rect).is_err() } {
+            return false;
+        }
+        let (x, y) = ((l.0 & 0xffff) as i16 as i32, ((l.0 >> 16) & 0xffff) as i16 as i32);
+        let side = size as i32 * unsafe { GetDpiForWindow(h) }.max(96) as i32 / 96;
+        x >= rect.right - side && y >= rect.bottom - side
+    }
+    unsafe extern "system" fn grip(h: HWND, msg: u32, w: WPARAM, l: LPARAM, _: usize, size: usize) -> LRESULT {
+        // GPUI would treat a press inside its client area as a click (and swallow it):
+        // let Windows start resizing instead.
+        if msg == WM_NCLBUTTONDOWN && w.0 as u32 == HTBOTTOMRIGHT && in_grip(h, l, size) {
+            return unsafe { DefWindowProcW(h, msg, w, l) };
+        }
+        let hit = unsafe { DefSubclassProc(h, msg, w, l) };
+        if msg == WM_NCHITTEST && hit.0 == HTCLIENT as isize && in_grip(h, l, size) {
+            return LRESULT(HTBOTTOMRIGHT as isize);
+        }
+        hit
+    }
+    unsafe {
+        let _ = SetWindowSubclass(hwnd(raw), Some(grip), 1, size as usize);
+    }
+}
+
 /// Drop everything the system draws around a window: the 1px border and rounded
 /// corners of Windows 11, and the shadow. Only our own (transparent) pixels remain.
 pub fn remove_window_frame(raw: isize) {

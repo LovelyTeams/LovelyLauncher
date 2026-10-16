@@ -16,14 +16,15 @@ use gpui::{
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::theme::Theme;
+use crate::{select::Selection, theme::Theme};
 
 /// Element ids for copy buttons must be unique per frame across renders.
 static COPY_IDS: AtomicUsize = AtomicUsize::new(0);
 
-pub fn render(source: &str, base_dir: Option<&Path>, theme: &Theme) -> Vec<AnyElement> {
+/// With `sel`, the text can be selected with the mouse (see [`Selection`]).
+pub fn render(source: &str, base_dir: Option<&Path>, sel: Option<&Selection>, theme: &Theme) -> Vec<AnyElement> {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    render_events(Parser::new_ext(source, options), base_dir, &[], theme)
+    render_events(Parser::new_ext(source, options), base_dir, &[], sel, theme)
 }
 
 /// Draw events that were produced elsewhere (the HTML preview builds its own).
@@ -32,10 +33,12 @@ pub fn render_events<'e>(
     events: impl IntoIterator<Item = Event<'e>>,
     base_dir: Option<&Path>,
     images: &[Arc<Image>],
+    sel: Option<&Selection>,
     theme: &Theme,
 ) -> Vec<AnyElement> {
     let mut r = Renderer {
         theme,
+        sel,
         base_dir,
         inline_images: images,
         stack: vec![Frame::new(Container::Root)],
@@ -95,6 +98,7 @@ struct TableState {
 
 struct Renderer<'a> {
     theme: &'a Theme,
+    sel: Option<&'a Selection>,
     base_dir: Option<&'a Path>,
     inline_images: &'a [Arc<Image>],
     stack: Vec<Frame>,
@@ -273,7 +277,9 @@ impl Renderer<'_> {
             }
             TagEnd::TableCell => {
                 let inline = self.inline.take().unwrap_or_default();
-                let cell = self.styled(inline).into_any_element();
+                // Cells of a row copy tab-separated, ready to paste into a spreadsheet.
+                let first = self.table.as_ref().and_then(|t| t.rows.last()).is_none_or(|row| row.is_empty());
+                let cell = self.text(inline.text, inline.highlights, if first { "\n" } else { "\t" });
                 if let Some(row) = self.table.as_mut().and_then(|t| t.rows.last_mut()) {
                     row.push(cell);
                 }
@@ -359,8 +365,12 @@ impl Renderer<'_> {
         }
     }
 
-    fn styled(&self, inline: Inline) -> StyledText {
-        StyledText::new(inline.text).with_highlights(inline.highlights)
+    /// A run of text: selectable when there is a selection to take part in.
+    fn text(&self, text: String, highlights: Vec<(Range<usize>, HighlightStyle)>, sep: &'static str) -> AnyElement {
+        match self.sel {
+            Some(sel) => sel.piece(text, highlights, sep, self.theme.selection),
+            None => StyledText::new(text).with_highlights(highlights).into_any_element(),
+        }
     }
 
     /// Emit the current inline buffer (paragraph / heading / tight list text).
@@ -368,7 +378,7 @@ impl Renderer<'_> {
         let heading = self.heading.take();
         if let Some(inline) = self.inline.take() {
             if !inline.text.trim().is_empty() {
-                let text = self.styled(inline);
+                let text = self.text(inline.text, inline.highlights, "\n");
                 let el = match heading {
                     Some(level) => {
                         let (size, top) = match level {
@@ -459,11 +469,13 @@ impl Renderer<'_> {
             .enumerate()
             .map(|(i, l)| {
                 let spans = highlights.as_ref().and_then(|h| h.get(i)).filter(|s| !s.is_empty());
-                match spans {
-                    Some(spans) => div()
-                        .child(StyledText::new(l.to_string()).with_highlights(crate::highlight::styled(spans, theme.dark)))
-                        .into_any_element(),
-                    None => div().child(if l.is_empty() { " ".to_string() } else { l.to_string() }).into_any_element(),
+                let styles = spans.map(|spans| crate::highlight::styled(spans, theme.dark)).unwrap_or_default();
+                match self.sel {
+                    Some(sel) => div().child(sel.piece(l.to_string(), styles, "\n", theme.selection)).into_any_element(),
+                    None if styles.is_empty() => {
+                        div().child(if l.is_empty() { " ".to_string() } else { l.to_string() }).into_any_element()
+                    }
+                    None => div().child(StyledText::new(l.to_string()).with_highlights(styles)).into_any_element(),
                 }
             })
             .collect();

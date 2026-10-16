@@ -135,6 +135,8 @@ pub struct Settings {
     pub space_preview: bool,
     /// Wrap long lines in text previews (otherwise scroll sideways).
     pub preview_wrap: bool,
+    /// Size the preview window was last resized to (logical pixels); none = per file type.
+    pub preview_size: Option<[f32; 2]>,
     /// Hold Alt to pop up a ring of favourite tools in the bottom-right corner.
     pub alt_ring: bool,
     /// …except while a full-screen program (a game, a video) is in front.
@@ -294,6 +296,7 @@ impl Default for Settings {
             last_update_check: 0,
             space_preview: true,
             preview_wrap: true,
+            preview_size: None,
             alt_ring: true,
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),

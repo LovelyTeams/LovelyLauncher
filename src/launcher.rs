@@ -1290,7 +1290,11 @@ impl Launcher {
                 return;
             }
         }
-        let (w, h) = crate::preview::initial_size(crate::preview::kind_of(&path));
+        // The size the user last gave the preview, else one that suits the file.
+        let (w, h) = match self.config.settings.preview_size {
+            Some([w, h]) => (w, h),
+            None => crate::preview::initial_size(crate::preview::kind_of(&path)),
+        };
         let launcher = cx.weak_entity();
         let wrap = self.config.settings.preview_wrap;
         let options = gpui::WindowOptions {
@@ -1312,7 +1316,7 @@ impl Launcher {
             ..Default::default()
         };
         match cx.open_window(options, move |window, cx| {
-            cx.new(|cx| crate::preview::Preview::new(path, anchor, wrap, launcher, window, cx))
+            cx.new(|cx| crate::preview::Preview::new(path, anchor, (w, h), wrap, launcher, window, cx))
         }) {
             Ok(handle) => self.preview = Some(handle),
             Err(err) => self.show_toast(format!("无法打开预览：{err}"), true, cx),
