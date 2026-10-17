@@ -23,6 +23,19 @@ pub enum Dialog {
     Category(CategoryEditor),
     Scan(ScanResults),
     StartMenu(StartMenuImport),
+    Snippet(SnippetEditor),
+}
+
+/// 文本片段: name and text (several lines).
+pub struct SnippetEditor {
+    /// The snippet being edited; `None` when adding one.
+    id: Option<String>,
+    name: Entity<TextInput>,
+    text: Entity<TextInput>,
+    error: Option<SharedString>,
+    /// Opened from 设置 → 剪贴板: go back there afterwards.
+    back_to_settings: bool,
+    focus: FocusHandle,
 }
 
 pub struct StartMenuImport {
@@ -111,13 +124,15 @@ pub enum SettingsTab {
     Preview,
     Ai,
     Search,
+    Clipboard,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 5] = [
+    const ALL: [SettingsTab; 6] = [
         SettingsTab::General,
         SettingsTab::Appearance,
         SettingsTab::Preview,
+        SettingsTab::Clipboard,
         SettingsTab::Ai,
         SettingsTab::Search,
     ];
@@ -129,6 +144,7 @@ impl SettingsTab {
             SettingsTab::Preview => "预览",
             SettingsTab::Ai => "AI 助手",
             SettingsTab::Search => "搜索",
+            SettingsTab::Clipboard => "剪贴板",
         }
     }
 }
@@ -144,6 +160,9 @@ pub struct SettingsEditor {
     ai_fetching: bool,
     search_url: Entity<TextInput>,
     hotkey: Entity<TextInput>,
+    clipboard_hotkey: Entity<TextInput>,
+    /// 清空剪贴板历史 was clicked once; the next click clears.
+    confirm_clear_clips: bool,
     terminal: Entity<TextInput>,
     accent: Entity<TextInput>,
     _accent_subscription: Subscription,
@@ -172,10 +191,12 @@ impl Dialog {
                 SettingsTab::Preview => Vec::new(),
                 SettingsTab::Ai => vec![s.ai_base_url.clone(), s.ai_key.clone(), s.ai_model.clone()],
                 SettingsTab::Search => vec![s.search_url.clone()],
+                SettingsTab::Clipboard => vec![s.clipboard_hotkey.clone()],
             },
             Dialog::Category(c) => vec![c.name.clone()],
             Dialog::Scan(_) => Vec::new(),
             Dialog::StartMenu(s) => vec![s.query.clone(), s.category.clone()],
+            Dialog::Snippet(s) => vec![s.name.clone(), s.text.clone()],
         }
     }
 
@@ -186,6 +207,7 @@ impl Dialog {
             Dialog::Category(c) => &c.focus,
             Dialog::Scan(s) => &s.focus,
             Dialog::StartMenu(s) => &s.focus,
+            Dialog::Snippet(s) => &s.focus,
         }
     }
 }
@@ -333,6 +355,263 @@ impl Launcher {
             .child(input.clone())
     }
 
+    /// A taller box for a multi-line input; it scrolls when the text is long.
+    fn area_box(&self, input: &Entity<TextInput>, theme: &Theme, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
+        let focused = input.focus_handle(cx).is_focused(window);
+        div()
+            .id("area-box")
+            .min_h(px(120.))
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .px(px(11.))
+            .py(px(8.))
+            .bg(theme.input_bg)
+            .rounded(px(9.))
+            .border_1()
+            .border_color(if focused { theme.accent } else { theme.border_strong })
+            .text_size(px(13.5))
+            .line_height(px(20.))
+            .child(input.clone())
+    }
+
+    /// Add (`id` none) or edit a 文本片段; `text` fills in the content of a new one.
+    pub fn open_snippet_editor(
+        &mut self,
+        id: Option<String>,
+        text: Option<String>,
+        back_to_settings: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        self.restore_full(cx);
+        let existing = id.as_ref().and_then(|id| self.config.snippets.iter().find(|s| &s.id == id)).cloned();
+        let content = existing.as_ref().map(|s| s.text.clone()).or(text).unwrap_or_default();
+        // A name suggested from the first line, for one made from the clipboard.
+        let suggested: String = match &existing {
+            Some(s) => s.name.clone(),
+            None => content.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(16).collect(),
+        };
+        let name = new_input(cx, "例如：邮箱签名、周报模板", &suggested);
+        let text_input = cx.new(|cx| {
+            let mut input = TextInput::new("要粘贴的内容，可以有多行", cx).multiline();
+            if !content.is_empty() {
+                input.set_text(content.clone(), cx);
+            }
+            input
+        });
+        name.update(cx, |input, cx| input.select_all_text(cx));
+        let focus = name.focus_handle(cx);
+        self.dialog = Some(Dialog::Snippet(SnippetEditor {
+            id: existing.map(|s| s.id),
+            name,
+            text: text_input,
+            error: None,
+            back_to_settings,
+            focus: cx.focus_handle(),
+        }));
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn close_snippet_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let back = matches!(&self.dialog, Some(Dialog::Snippet(e)) if e.back_to_settings);
+        self.close_dialog(window, cx);
+        if back {
+            self.open_settings_at(SettingsTab::Clipboard, window, cx);
+        }
+    }
+
+    fn save_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::Snippet(editor)) = self.dialog.as_ref() else { return };
+        let name = editor.name.read(cx).text().trim().to_string();
+        let text = editor.text.read(cx).committed_text();
+        let error = if name.is_empty() {
+            Some("名称不能为空")
+        } else if text.trim().is_empty() {
+            Some("内容不能为空")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            if let Some(Dialog::Snippet(editor)) = self.dialog.as_mut() {
+                editor.error = Some(error.into());
+            }
+            cx.notify();
+            return;
+        }
+        match editor.id.clone() {
+            Some(id) => {
+                if let Some(s) = self.config.snippets.iter_mut().find(|s| s.id == id) {
+                    s.name = name;
+                    s.text = text;
+                }
+            }
+            None => self.config.snippets.push(crate::config::Snippet { id: crate::config::new_id(), name, text }),
+        }
+        self.config.save();
+        self.refresh_results();
+        self.close_snippet_editor(window, cx);
+        self.show_toast("文本片段已保存", false, cx);
+    }
+
+    pub fn open_settings_at(&mut self, tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+        if let Some(Dialog::Settings(editor)) = self.dialog.as_mut() {
+            editor.tab = tab;
+        }
+        cx.notify();
+    }
+
+    fn render_clipboard_settings(&self, editor: &SettingsEditor, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let settings = &self.config.settings;
+        let section = |title: &'static str| {
+            div().mt(px(6.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.accent).child(title)
+        };
+        let recording = settings.clipboard_history;
+        let count = self.clips.len();
+        let confirm = editor.confirm_clear_clips;
+        let snippets = self.config.snippets.iter().enumerate().map(|(ix, s)| {
+            let preview: String = s.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(60).collect();
+            let (edit_id, remove_id) = (s.id.clone(), s.id.clone());
+            div()
+                .id(("snippet", ix))
+                .group("snippet-row")
+                .h(px(44.))
+                .px(px(10.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.row_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_snippet_editor(Some(edit_id.clone()), None, true, window, cx)
+                }))
+                .child(icon("type", 15., theme.text_muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(13.)).truncate().child(s.name.clone()))
+                        .child(div().text_size(px(11.5)).text_color(theme.text_faint).truncate().child(preview)),
+                )
+                .child(
+                    div()
+                        .id(("snippet-remove", ix))
+                        .size(px(26.))
+                        .rounded(px(7.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|d| d.bg(theme.danger.opacity(0.12)))
+                        .child(icon("trash", 13., theme.text_faint))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_snippet(&remove_id, cx);
+                            }),
+                        ),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(section("剪贴板历史"))
+            .child(
+                div()
+                    .id("clipboard-history")
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .py(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let on = !this.config.settings.clipboard_history;
+                        this.config.settings.clipboard_history = on;
+                        crate::clipboard::ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+                        this.config.save();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.5)).child("记录剪贴板历史"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_faint)
+                                    .child("复制过的文字、图片和文件只保存在本机；密码管理器标记为不记录的内容会跳过"),
+                            ),
+                    )
+                    .child(switch("clipboard-history-switch", recording, theme)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(div().w(px(130.)).flex_none().text_size(px(13.)).child("打开剪贴板历史"))
+                    .child(self.input_box(&editor.clipboard_hotkey, theme, window, cx).flex_1().min_w_0()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_faint)
+                    .child("在任意窗口按这个快捷键（或在搜索框输入 cb），选中一条按 Enter 就会粘贴回原来的窗口；Ctrl+Enter 只复制。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().flex_1().text_size(px(12.5)).text_color(theme.text_muted).child(format!("已记录 {count} 条")))
+                    .child(
+                        button("clear-clips", if confirm { "再点一次清空" } else { "清空历史（保留固定的）" }, false, theme)
+                            .when(confirm, |b| b.text_color(theme.danger))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                let Some(Dialog::Settings(editor)) = this.dialog.as_mut() else { return };
+                                if editor.confirm_clear_clips {
+                                    editor.confirm_clear_clips = false;
+                                    this.clear_clips(cx);
+                                } else {
+                                    editor.confirm_clear_clips = true;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().child(section("文本片段")))
+                    .child(button("new-snippet", "+ 新建片段", false, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.open_snippet_editor(None, None, true, window, cx),
+                    ))),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_faint)
+                    .child("常用的签名、地址、模板：在搜索框输入名称或 cb 就能找到，Enter 粘贴。剪贴板历史里的文字也可以右键“存为文本片段”。"),
+            )
+            .when(self.config.snippets.is_empty(), |d| {
+                d.child(div().py(px(10.)).text_size(px(12.5)).text_color(theme.text_faint).child("还没有文本片段"))
+            })
+            .children(snippets)
+            .into_any_element()
+    }
+
     // -----------------------------------------------------------------------
     // Opening / closing
 
@@ -468,6 +747,8 @@ impl Launcher {
             ai_fetching: false,
             search_url: new_input(cx, "https://example.com/search?q={q}", &settings.search_engine),
             hotkey: new_input(cx, "Alt+Space", &settings.hotkey),
+            clipboard_hotkey: new_input(cx, "留空则不设置全局快捷键", &settings.clipboard_hotkey),
+            confirm_clear_clips: false,
             terminal: new_input(cx, "留空则自动检测", &settings.terminal),
             accent,
             _accent_subscription: accent_subscription,
@@ -538,6 +819,7 @@ impl Launcher {
             Some(Dialog::Category(_)) => self.save_category(window, cx),
             Some(Dialog::Scan(_)) => self.close_dialog(window, cx),
             Some(Dialog::StartMenu(_)) => self.import_start_menu(false, window, cx),
+            Some(Dialog::Snippet(_)) => self.save_snippet(window, cx),
             None => {}
         }
     }
@@ -687,6 +969,21 @@ impl Launcher {
         };
         let hotkey = editor.hotkey.read(cx).text().trim().to_string();
         let terminal = editor.terminal.read(cx).text().trim().to_string();
+        let clipboard_hotkey = editor.clipboard_hotkey.read(cx).text().trim().to_string();
+        if clipboard_hotkey != self.config.settings.clipboard_hotkey {
+            let applied = cx.update_global::<crate::system::HotkeyService, _>(|service, _| service.apply_clipboard(&clipboard_hotkey));
+            match applied {
+                Ok(()) => self.config.settings.clipboard_hotkey = clipboard_hotkey,
+                Err(err) => {
+                    if let Some(Dialog::Settings(editor)) = self.dialog.as_mut() {
+                        editor.status = Some((format!("剪贴板历史快捷键：{err}").into(), true));
+                        editor.tab = SettingsTab::Clipboard;
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if hotkey != self.config.settings.hotkey {
             if let Err(err) = self.apply_hotkey(&hotkey, cx) {
                 if let Some(Dialog::Settings(editor)) = self.dialog.as_mut() {
@@ -894,7 +1191,7 @@ impl Launcher {
                 let visual = Self::tool_visual(&draft);
                 Some(self.tile(&visual, 56., 28., theme, cx))
             }
-            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) => None,
+            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) | Dialog::Snippet(_) => None,
         };
         let dialog = self.dialog.as_ref()?;
         let focus = dialog.focus_handle().clone();
@@ -922,6 +1219,41 @@ impl Launcher {
                 "设置",
                 self.render_settings_form(editor, theme, window, cx),
                 self.render_settings_footer(theme, cx),
+            ),
+            Dialog::Snippet(editor) => (
+                if editor.id.is_some() { "编辑文本片段" } else { "新建文本片段" },
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(label("名称（搜索时用）", theme))
+                    .child(self.input_box(&editor.name, theme, window, cx))
+                    .child(label("内容", theme))
+                    .child(self.area_box(&editor.text, theme, window, cx))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_faint)
+                            .child("Enter 换行。可用变量：{date} 日期、{time} 时间、{datetime} 日期和时间、{clipboard} 当前剪贴板文字"),
+                    )
+                    .when_some(editor.error.clone(), |d, err| {
+                        d.child(div().text_size(px(12.5)).text_color(theme.danger).child(err))
+                    })
+                    .into_any_element(),
+                div()
+                    .flex_none()
+                    .px(px(22.))
+                    .py(px(16.))
+                    .flex()
+                    .justify_end()
+                    .gap(px(10.))
+                    .child(button("snippet-cancel", "取消", false, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.close_snippet_editor(window, cx),
+                    )))
+                    .child(button("snippet-save", "保存", true, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.save_snippet(window, cx),
+                    )))
+                    .into_any_element(),
             ),
             Dialog::Category(editor) => (
                 if editor.original.is_some() { "重命名分类" } else { "新建分类" },
@@ -2275,6 +2607,7 @@ impl Launcher {
             SettingsTab::Preview => self.render_preview_settings(theme, cx),
             SettingsTab::Ai => self.render_ai_settings(editor, theme, window, cx),
             SettingsTab::Search => self.render_search_settings(editor, theme, window, cx),
+            SettingsTab::Clipboard => self.render_clipboard_settings(editor, theme, window, cx),
         };
         div()
             .flex()

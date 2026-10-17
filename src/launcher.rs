@@ -41,6 +41,7 @@ actions!(
         QuickNote,
         PickColor,
         MeasureScreen,
+        ClipboardHistory,
         OpenSettings,
         AddTool,
         FocusNextField,
@@ -65,6 +66,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-n", QuickNote, launcher),
         KeyBinding::new("ctrl-shift-c", PickColor, launcher),
         KeyBinding::new("ctrl-shift-r", MeasureScreen, launcher),
+        KeyBinding::new("ctrl-shift-v", ClipboardHistory, launcher),
         KeyBinding::new("ctrl-,", OpenSettings, launcher),
         KeyBinding::new("ctrl-d", AddTool, launcher),
         KeyBinding::new("tab", FocusNextField, dialog),
@@ -83,10 +85,12 @@ pub enum QuickAction {
     Note,
     ColorPicker,
     Ruler,
+    Clipboard,
 }
 
 impl QuickAction {
-    pub const ALL: [QuickAction; 7] = [
+    pub const ALL: [QuickAction; 8] = [
+        QuickAction::Clipboard,
         QuickAction::NewTerminal,
         QuickAction::OpenProject,
         QuickAction::Screenshot,
@@ -105,6 +109,7 @@ impl QuickAction {
             QuickAction::Note => "快速笔记",
             QuickAction::ColorPicker => "取色器",
             QuickAction::Ruler => "屏幕标尺",
+            QuickAction::Clipboard => "剪贴板历史",
         }
     }
 
@@ -117,6 +122,7 @@ impl QuickAction {
             QuickAction::Note => "note",
             QuickAction::ColorPicker => "pipette",
             QuickAction::Ruler => "ruler",
+            QuickAction::Clipboard => "clipboard",
         }
     }
 
@@ -129,6 +135,7 @@ impl QuickAction {
             QuickAction::Note => &["Ctrl", "N"],
             QuickAction::ColorPicker => &["Ctrl", "Shift", "C"],
             QuickAction::Ruler => &["Ctrl", "Shift", "R"],
+            QuickAction::Clipboard => &["Ctrl", "Shift", "V"],
         }
     }
 
@@ -141,11 +148,36 @@ impl QuickAction {
             QuickAction::Note => "action:note",
             QuickAction::ColorPicker => "action:color",
             QuickAction::Ruler => "action:ruler",
+            QuickAction::Clipboard => "action:clipboard",
         }
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.key() == key)
+    }
+}
+
+/// `cb` or `cb …` in the search box: what to filter 剪贴板历史 by.
+fn clipboard_filter(query: &str) -> Option<&str> {
+    let query = query.trim_start();
+    if !query.get(..2)?.eq_ignore_ascii_case("cb") {
+        return None;
+    }
+    match &query[2..] {
+        "" => Some(""),
+        tail => tail.strip_prefix(' ').map(str::trim),
+    }
+}
+
+fn snippet_item(snippet: &crate::config::Snippet, score: i32) -> ResultItem {
+    let preview: String = snippet.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(80).collect();
+    ResultItem {
+        target: Target::Snippet(snippet.id.clone()),
+        title: snippet.name.clone().into(),
+        subtitle: format!("文本片段 · {preview}").into(),
+        badge: "片段",
+        visual: Visual::Glyph { icon: "type", tint: "purple".into() },
+        score,
     }
 }
 
@@ -231,6 +263,10 @@ pub enum Target {
     Command(String),
     /// A file or folder found by Everything.
     File { path: PathBuf, is_dir: bool },
+    /// A 剪贴板历史 entry (by id): pasted.
+    Clip(String),
+    /// A 文本片段 (by id): pasted.
+    Snippet(String),
 }
 
 impl Target {
@@ -371,6 +407,8 @@ pub enum MenuTarget {
     Project(String),
     History(String),
     Action(QuickAction),
+    Clip(String),
+    Snippet(String),
 }
 
 pub struct ContextMenu {
@@ -420,6 +458,11 @@ pub struct Launcher {
     pub(crate) ai_history_scroll: ScrollHandle,
     /// 清空 was clicked once; the next click really clears.
     pub(crate) ai_history_confirm_clear: bool,
+    /// 剪贴板历史, newest first.
+    pub(crate) clips: Vec<crate::clipboard::Clip>,
+    clips_save_generation: u64,
+    /// The window that was in front before the launcher was called up: pastes go there.
+    prev_foreground: Option<isize>,
     pub(crate) update: UpdateState,
     pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
     /// The Alt ring popup, created on first use and then kept (hidden) for reuse.
@@ -537,6 +580,9 @@ impl Launcher {
             ai_history_selected: 0,
             ai_history_scroll: ScrollHandle::new(),
             ai_history_confirm_clear: false,
+            clips: crate::clipboard::load(),
+            clips_save_generation: 0,
+            prev_foreground: None,
             update: UpdateState::default(),
             preview: None,
             ring: None,
@@ -575,6 +621,7 @@ impl Launcher {
             this.show_toast(format!("已更新到 v{}", crate::update::CURRENT_VERSION), false, cx);
         }
         this.scan_apps(cx);
+        this.listen_to_clipboard(cx);
         this.schedule_update_check(cx);
         this.reload_wallpaper(window, cx);
         this
@@ -771,6 +818,7 @@ impl Launcher {
     pub fn handle_app_event(&mut self, event: AppEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             AppEvent::Hotkey => {
+                self.remember_foreground();
                 let visible = self.hwnd.is_some_and(win::is_window_visible);
                 if visible && window.is_window_active() {
                     self.hide(window, cx);
@@ -781,6 +829,7 @@ impl Launcher {
                 }
             }
             AppEvent::Toggle => {
+                self.remember_foreground();
                 let visible = self.hwnd.is_some_and(win::is_window_visible);
                 if visible && window.is_window_active() && !self.mini {
                     self.hide(window, cx);
@@ -799,7 +848,14 @@ impl Launcher {
                 self.open_settings(window, cx);
             }
             AppEvent::Preview(event) => self.handle_preview_event(event, window, cx),
-            AppEvent::Action(action) => self.activate(Target::Action(action), false, window, cx),
+            AppEvent::Action(action) => {
+                self.remember_foreground();
+                self.activate(Target::Action(action), false, window, cx)
+            }
+            AppEvent::ClipboardHotkey => {
+                self.remember_foreground();
+                self.open_clipboard_history(window, cx);
+            }
             AppEvent::Quit => {
                 self.config.save();
                 cx.quit();
@@ -1019,6 +1075,12 @@ impl Launcher {
             return;
         }
 
+        // `cb …`: 剪贴板历史 and 文本片段.
+        if let Some(filter) = clipboard_filter(raw) {
+            self.results = self.clipboard_results(&filter.to_lowercase());
+            return;
+        }
+
         let mut items: Vec<ResultItem> = Vec::new();
 
         if let Some(cmd) = raw.strip_prefix('>') {
@@ -1125,6 +1187,12 @@ impl Launcher {
             }
         }
 
+        for snippet in &self.config.snippets {
+            if let Some(score) = SearchKey::new(&snippet.name).score(&q) {
+                items.push(snippet_item(snippet, score));
+            }
+        }
+
         for action in QuickAction::ALL {
             if let Some(score) = SearchKey::new(action.label()).score(&q) {
                 items.push(ResultItem {
@@ -1155,6 +1223,226 @@ impl Launcher {
             score: i32::MIN,
         });
         self.results = items;
+    }
+
+    // -----------------------------------------------------------------------
+    // 剪贴板历史 and 文本片段
+
+    fn listen_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        crate::clipboard::ENABLED.store(self.config.settings.clipboard_history, std::sync::atomic::Ordering::Relaxed);
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        crate::clipboard::listen(tx);
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(copied) = rx.next().await {
+                let alive = this.update(cx, |this, cx| this.on_copied(copied, cx)).is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_copied(&mut self, copied: crate::clipboard::Copied, cx: &mut Context<Self>) {
+        let dropped = crate::clipboard::remember(&mut self.clips, copied, now_secs());
+        if !dropped.is_empty() {
+            cx.background_spawn(async move { crate::clipboard::delete_images(&dropped) }).detach();
+        }
+        self.save_clips_soon(cx);
+        if clipboard_filter(self.search_text.trim()).is_some() {
+            self.refresh_results();
+            self.sync_mini_size(cx);
+        }
+        cx.notify();
+    }
+
+    /// Write clipboard.json a little later, off the UI thread.
+    fn save_clips_soon(&mut self, cx: &mut Context<Self>) {
+        self.clips_save_generation += 1;
+        let generation = self.clips_save_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let snapshot = this
+                .read_with(cx, |this, _| (this.clips_save_generation == generation).then(|| this.clips.clone()))
+                .ok()
+                .flatten();
+            if let Some(list) = snapshot {
+                cx.background_spawn(async move { crate::clipboard::save(&list) }).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Remember the window in front (not ours) so a paste can go back to it.
+    fn remember_foreground(&mut self) {
+        if let Some(h) = win::foreign_foreground_window() {
+            self.prev_foreground = Some(h);
+        }
+    }
+
+    /// Show 剪贴板历史: the search box set to `cb `.
+    pub fn open_clipboard_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = None;
+        let visible = self.hwnd.is_some_and(win::is_window_visible);
+        if !visible {
+            if self.config.settings.mini_on_hotkey {
+                self.show_mini(window, cx);
+            } else {
+                self.show(window, cx);
+            }
+        }
+        self.search.update(cx, |input, cx| input.set_text("cb ", cx));
+        window.focus(&self.search.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn clipboard_results(&self, filter: &str) -> Vec<ResultItem> {
+        let mut items = Vec::new();
+        let clips = self.clips.iter().filter(|c| c.matches(filter));
+        // Pinned ones first, then newest first.
+        let (pinned, rest): (Vec<_>, Vec<_>) = clips.partition(|c| c.pinned);
+        for clip in pinned.into_iter().chain(rest).take(100) {
+            let visual = match clip.kind {
+                crate::clipboard::Kind::Image => Visual::Image { path: clip.image_path().display().to_string() },
+                crate::clipboard::Kind::Files => Visual::Glyph { icon: "folder", tint: "orange".into() },
+                crate::clipboard::Kind::Text => Visual::Glyph { icon: "clipboard", tint: "pink".into() },
+            };
+            items.push(ResultItem {
+                target: Target::Clip(clip.id.clone()),
+                title: clip.title().into(),
+                subtitle: format!("{} · {}", crate::config::relative_time(clip.time), clip.detail()).into(),
+                badge: if clip.pinned { "固定" } else { "剪贴板" },
+                visual,
+                score: 0,
+            });
+        }
+        for snippet in &self.config.snippets {
+            let text = format!("{}\n{}", snippet.name, snippet.text).to_lowercase();
+            if filter.split_whitespace().all(|w| text.contains(w)) {
+                items.push(snippet_item(snippet, 0));
+            }
+        }
+        if items.is_empty() {
+            items.push(ResultItem {
+                target: Target::Action(QuickAction::Clipboard),
+                title: if filter.is_empty() { "还没有剪贴板记录".into() } else { format!("没有包含“{filter}”的记录").into() },
+                subtitle: if self.config.settings.clipboard_history {
+                    "复制过的文字、图片和文件会出现在这里".into()
+                } else {
+                    "剪贴板历史已在 设置 → 剪贴板 中关闭".into()
+                },
+                badge: "",
+                visual: Visual::Glyph { icon: "clipboard", tint: "slate".into() },
+                score: 0,
+            });
+        }
+        items
+    }
+
+    /// Paste (or just copy) a 剪贴板历史 entry.
+    pub fn use_clip(&mut self, id: &str, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(clip) = self.clips.iter().find(|c| c.id == id).cloned() else { return };
+        match clip.kind {
+            crate::clipboard::Kind::Text => cx.write_to_clipboard(gpui::ClipboardItem::new_string(clip.text.clone())),
+            crate::clipboard::Kind::Files | crate::clipboard::Kind::Image => {}
+        }
+        self.deliver(Some(clip), paste, window, cx);
+    }
+
+    /// Paste (or just copy) a 文本片段, its variables filled in.
+    pub fn use_snippet(&mut self, id: &str, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snippet) = self.config.snippets.iter().find(|s| s.id == id) else { return };
+        let current = cx.read_from_clipboard().and_then(|item| item.text());
+        let text = crate::clipboard::expand(&snippet.text, current.as_deref());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.deliver(None, paste, window, cx);
+    }
+
+    /// Hand the clipboard over: pictures and files are put there off the UI thread;
+    /// then, when pasting, switch back to the window that was in front and press Ctrl+V.
+    fn deliver(&mut self, clip: Option<crate::clipboard::Clip>, paste: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.prev_foreground.filter(|_| paste);
+        if paste {
+            self.hide(window, cx);
+        }
+        let task = cx.background_spawn(async move {
+            let ok = match clip {
+                Some(c) if c.kind == crate::clipboard::Kind::Files => win::set_clipboard_files(&c.files()),
+                Some(c) if c.kind == crate::clipboard::Kind::Image => image::open(c.image_path())
+                    .ok()
+                    .map(|img| {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        let bgra: Vec<u8> = rgba.pixels().flat_map(|p| [p.0[2], p.0[1], p.0[0], p.0[3]]).collect();
+                        win::set_clipboard_image(w, h, &bgra)
+                    })
+                    .unwrap_or(false),
+                _ => true,
+            };
+            if ok && let Some(target) = target {
+                std::thread::sleep(Duration::from_millis(60));
+                win::paste_into(target);
+            }
+            ok
+        });
+        cx.spawn(async move |this, cx| {
+            let ok = task.await;
+            this.update(cx, |this, cx| {
+                if !ok {
+                    this.show_toast("无法放到剪贴板（文件或图片可能已被删除）", true, cx);
+                } else if target.is_none() {
+                    this.show_toast("已复制到剪贴板", false, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn toggle_pin_clip(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(clip) = self.clips.iter_mut().find(|c| c.id == id) {
+            clip.pinned = !clip.pinned;
+        }
+        self.save_clips_soon(cx);
+        self.refresh_results();
+        cx.notify();
+    }
+
+    pub fn remove_clip(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.clips.iter().position(|c| c.id == id) else { return };
+        let clip = self.clips.remove(ix);
+        if clip.kind == crate::clipboard::Kind::Image && !self.clips.iter().any(|c| c.image == clip.image) {
+            let files = vec![clip.image];
+            cx.background_spawn(async move { crate::clipboard::delete_images(&files) }).detach();
+        }
+        self.save_clips_soon(cx);
+        self.refresh_results();
+        self.sync_mini_size(cx);
+        cx.notify();
+    }
+
+    /// Clear 剪贴板历史, keeping the pinned entries.
+    pub fn clear_clips(&mut self, cx: &mut Context<Self>) {
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.clips).into_iter().partition(|c| c.pinned);
+        let files: Vec<String> = gone
+            .into_iter()
+            .filter(|c| c.kind == crate::clipboard::Kind::Image && !kept.iter().any(|k| k.image == c.image))
+            .map(|c| c.image)
+            .collect();
+        self.clips = kept;
+        cx.background_spawn(async move { crate::clipboard::delete_images(&files) }).detach();
+        self.save_clips_soon(cx);
+        self.refresh_results();
+        self.show_toast("已清空剪贴板历史（固定的保留）", false, cx);
+        cx.notify();
+    }
+
+    pub fn remove_snippet(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.config.snippets.retain(|s| s.id != id);
+        self.config.save();
+        self.refresh_results();
+        cx.notify();
     }
 
     pub fn refresh_results(&mut self) {
@@ -1925,6 +2213,7 @@ impl Launcher {
         let query = self.search_text.trim().to_string();
         if !self.config.settings.everything
             || self.ai_request().is_some()
+            || clipboard_filter(&query).is_some()
             || query.chars().count() < 2
             || query.starts_with('>')
             || looks_like_url(&query)
@@ -2191,6 +2480,15 @@ impl Launcher {
             Target::Command(cmd) => {
                 self.spawn_launch("cmd.exe".into(), format!("/k {cmd}"), home_dir(), admin, cx);
             }
+            Target::Clip(id) => {
+                // Ctrl+Enter: copy only.
+                self.use_clip(id, !admin, window, cx);
+                hide = false;
+            }
+            Target::Snippet(id) => {
+                self.use_snippet(id, !admin, window, cx);
+                hide = false;
+            }
         }
         self.config.save();
         if hide && (self.mini || self.config.settings.hide_after_launch) {
@@ -2290,6 +2588,10 @@ impl Launcher {
             }
             QuickAction::Ruler => {
                 self.start_overlay(crate::overlay::Mode::Ruler, window, cx);
+                false
+            }
+            QuickAction::Clipboard => {
+                self.open_clipboard_history(window, cx);
                 false
             }
             QuickAction::Note => {

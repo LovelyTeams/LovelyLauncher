@@ -502,6 +502,103 @@ pub fn cursor_in_window(raw: isize) -> Option<(f32, f32)> {
     Some(((cursor.x - rect.left) as f32 / scale, (cursor.y - rect.top) as f32 / scale))
 }
 
+/// The window in front, unless it is one of ours.
+pub fn foreign_foreground_window() -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let h = unsafe { GetForegroundWindow() };
+    if h.0.is_null() {
+        return None;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    (pid != std::process::id()).then_some(h.0 as isize)
+}
+
+/// Bring `target` back to the front and press Ctrl+V in it.
+pub fn paste_into(target: isize) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+        VK_CONTROL,
+    };
+    unsafe {
+        let _ = SetForegroundWindow(hwnd(target));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(90));
+    let key = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    let v = VIRTUAL_KEY(b'V' as u16);
+    let none = KEYBD_EVENT_FLAGS(0);
+    let inputs = [key(VK_CONTROL, none), key(v, none), key(v, KEYEVENTF_KEYUP), key(VK_CONTROL, KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// Put `data` on the clipboard as `format`, replacing what is there.
+fn set_clipboard(format: u32, data: &[u8]) -> bool {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+        },
+    };
+    unsafe {
+        let Ok(global) = GlobalAlloc(GMEM_MOVEABLE, data.len()) else { return false };
+        let ptr = GlobalLock(global) as *mut u8;
+        if ptr.is_null() {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        let _ = GlobalUnlock(global);
+        for _ in 0..10 {
+            if OpenClipboard(None).is_ok() {
+                let _ = EmptyClipboard();
+                let ok = SetClipboardData(format, Some(HANDLE(global.0))).is_ok();
+                let _ = CloseClipboard();
+                return ok;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
+    }
+}
+
+/// Copy files, as Explorer does (they can be pasted into a folder).
+pub fn set_clipboard_files(paths: &[String]) -> bool {
+    // DROPFILES: offset of the list, a point, two BOOLs (fNC, fWide); then the paths.
+    let mut data: Vec<u8> = Vec::new();
+    for v in [20u32, 0, 0, 0, 1] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    for path in paths {
+        for unit in path.encode_utf16().chain([0]) {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    data.extend_from_slice(&[0, 0]);
+    set_clipboard(15, &data)
+}
+
+/// Copy a picture (BGRA, top row first) as a device-independent bitmap.
+pub fn set_clipboard_image(width: u32, height: u32, bgra: &[u8]) -> bool {
+    let mut data = Vec::with_capacity(40 + bgra.len());
+    for v in [40u32, width] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    // A negative height means rows from the top.
+    data.extend_from_slice(&(-(height as i32)).to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&32u16.to_le_bytes());
+    for v in [0u32, bgra.len() as u32, 0, 0, 0, 0] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    data.extend_from_slice(bgra);
+    set_clipboard(8, &data)
+}
+
 /// Unassigned virtual key that [`send_mask_key`] presses.
 pub const MASK_KEY: u16 = 0xE8;
 

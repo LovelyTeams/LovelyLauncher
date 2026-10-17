@@ -327,6 +327,11 @@ fn bgra_to_luma(pixels: &[u8]) -> Vec<u8> {
 // Clipboard
 
 /// The clipboard's image, if it has one: PNG when offered, else the bitmap (DIB).
+/// The picture on the clipboard: (width, height, BGRA).
+pub fn clipboard_picture() -> Option<(u32, u32, Vec<u8>)> {
+    clipboard_image().map(|c| (c.width, c.height, c.bgra))
+}
+
 fn clipboard_image() -> Option<Capture> {
     let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     let (bytes, is_png) = unsafe {

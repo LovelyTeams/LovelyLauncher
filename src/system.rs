@@ -27,12 +27,18 @@ pub enum AppEvent {
     Preview(crate::preview::hook::HookEvent),
     /// Run a quick action (picked in the ring, which has no access to the launcher's window).
     Action(crate::launcher::QuickAction),
+    /// The 剪贴板历史 hotkey.
+    ClipboardHotkey,
 }
 
 pub struct HotkeyService {
     manager: Option<GlobalHotKeyManager>,
     current: Option<HotKey>,
+    clipboard: Option<HotKey>,
 }
+
+/// Id of the registered 剪贴板历史 hotkey (0: none), read by the event handler.
+static CLIPBOARD_HOTKEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Global for HotkeyService {}
 
@@ -40,13 +46,47 @@ impl HotkeyService {
     pub fn new(tx: UnboundedSender<AppEvent>) -> Self {
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
             if event.state == HotKeyState::Pressed {
-                let _ = tx.unbounded_send(AppEvent::Hotkey);
+                let clipboard = CLIPBOARD_HOTKEY.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = tx.unbounded_send(if clipboard != 0 && event.id == clipboard {
+                    AppEvent::ClipboardHotkey
+                } else {
+                    AppEvent::Hotkey
+                });
             }
         }));
         Self {
             manager: GlobalHotKeyManager::new().ok(),
             current: None,
+            clipboard: None,
         }
+    }
+
+    /// Register `spec` as the 剪贴板历史 hotkey (empty: none).
+    pub fn apply_clipboard(&mut self, spec: &str) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let manager = self.manager.as_ref().ok_or("无法初始化全局快捷键")?;
+        if spec.trim().is_empty() {
+            if let Some(old) = self.clipboard.take() {
+                let _ = manager.unregister(old);
+            }
+            CLIPBOARD_HOTKEY.store(0, Ordering::Relaxed);
+            return Ok(());
+        }
+        let hotkey: HotKey = normalize(spec).parse().map_err(|e| format!("快捷键格式无效：{e}"))?;
+        if self.clipboard == Some(hotkey) {
+            return Ok(());
+        }
+        if self.current == Some(hotkey) {
+            return Err("和呼出快捷键重复了".into());
+        }
+        manager
+            .register(hotkey)
+            .map_err(|_| format!("快捷键 {spec} 注册失败，可能已被其他程序占用"))?;
+        if let Some(old) = self.clipboard.replace(hotkey) {
+            let _ = manager.unregister(old);
+        }
+        CLIPBOARD_HOTKEY.store(hotkey.id(), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Register `spec` (e.g. "Alt+Space") in place of the current hotkey.

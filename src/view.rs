@@ -1271,6 +1271,8 @@ impl Launcher {
                     path: path.clone(),
                     is_dir: *is_dir,
                 }),
+                Target::Clip(id) => Some(MenuTarget::Clip(id.clone())),
+                Target::Snippet(id) => Some(MenuTarget::Snippet(id.clone())),
                 _ => None,
             };
             rows.push(
@@ -1959,6 +1961,27 @@ impl Launcher {
                     ("circle", if in_ring { "移出圆环" } else { "加入圆环" }.into(), MenuCommand::ToggleRingAction(*action), false),
                 ]
             }
+            MenuTarget::Clip(id) => {
+                let clip = self.clips.iter().find(|c| &c.id == id);
+                let pinned = clip.is_some_and(|c| c.pinned);
+                let text = clip.is_some_and(|c| c.kind == crate::clipboard::Kind::Text);
+                let mut entries = vec![
+                    ("enter", "粘贴".into(), MenuCommand::Open(Target::Clip(id.clone())), false),
+                    ("copy", "仅复制".into(), MenuCommand::CopyClip(id.clone()), false),
+                    ("pin", if pinned { "取消固定" } else { "固定" }.into(), MenuCommand::PinClip(id.clone()), false),
+                ];
+                if text {
+                    entries.push(("type", "存为文本片段…".into(), MenuCommand::ClipToSnippet(id.clone()), false));
+                }
+                entries.push(("trash", "删除".into(), MenuCommand::RemoveClip(id.clone()), true));
+                entries
+            }
+            MenuTarget::Snippet(id) => vec![
+                ("enter", "粘贴".into(), MenuCommand::Open(Target::Snippet(id.clone())), false),
+                ("copy", "复制".into(), MenuCommand::CopySnippet(id.clone()), false),
+                ("edit", "编辑…".into(), MenuCommand::EditSnippet(id.clone()), false),
+                ("trash", "删除".into(), MenuCommand::RemoveSnippet(id.clone()), true),
+            ],
         }
     }
 
@@ -2047,6 +2070,16 @@ impl Launcher {
             MenuCommand::RemoveProject(path) => self.remove_project(&path, cx),
             MenuCommand::RemoveHistory(key) => self.remove_history(&key, cx),
             MenuCommand::ToggleRingAction(action) => self.toggle_ring_action(action, cx),
+            MenuCommand::CopyClip(id) => self.use_clip(&id, false, window, cx),
+            MenuCommand::PinClip(id) => self.toggle_pin_clip(&id, cx),
+            MenuCommand::ClipToSnippet(id) => {
+                let text = self.clips.iter().find(|c| c.id == id).map(|c| c.text.clone()).unwrap_or_default();
+                self.open_snippet_editor(None, Some(text), false, window, cx);
+            }
+            MenuCommand::RemoveClip(id) => self.remove_clip(&id, cx),
+            MenuCommand::CopySnippet(id) => self.use_snippet(&id, false, window, cx),
+            MenuCommand::EditSnippet(id) => self.open_snippet_editor(Some(id), None, false, window, cx),
+            MenuCommand::RemoveSnippet(id) => self.remove_snippet(&id, cx),
         }
         cx.notify();
     }
@@ -2121,6 +2154,13 @@ pub enum MenuCommand {
     RemoveProject(String),
     RemoveHistory(String),
     ToggleRingAction(QuickAction),
+    CopyClip(String),
+    PinClip(String),
+    ClipToSnippet(String),
+    RemoveClip(String),
+    CopySnippet(String),
+    EditSnippet(String),
+    RemoveSnippet(String),
 }
 
 /// A hint shown when hovering, e.g. a quick action's shortcut.
@@ -2220,6 +2260,9 @@ impl Render for Launcher {
             }))
             .on_action(cx.listener(|this, _: &MeasureScreen, window, cx| {
                 this.quick_action(QuickAction::Ruler, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ClipboardHistory, window, cx| {
+                this.quick_action(QuickAction::Clipboard, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 if this.dialog.is_none() {

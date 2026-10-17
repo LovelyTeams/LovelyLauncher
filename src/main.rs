@@ -3,6 +3,7 @@
 
 mod ai;
 mod ai_history;
+mod clipboard;
 mod config;
 mod dialogs;
 mod download;
@@ -88,6 +89,9 @@ fn main() {
 
             let mut hotkeys = HotkeyService::new(tx.clone());
             let hotkey_error = hotkeys.apply(&config.settings.hotkey).err();
+            let hotkey_error = hotkey_error.or_else(|| {
+                hotkeys.apply_clipboard(&config.settings.clipboard_hotkey).err().map(|e| format!("剪贴板历史快捷键：{e}"))
+            });
             cx.set_global(hotkeys);
             cx.set_global(TrayHolder(system::create_tray(tx.clone())));
             preview::hook::ENABLED.store(config.settings.space_preview, std::sync::atomic::Ordering::Relaxed);

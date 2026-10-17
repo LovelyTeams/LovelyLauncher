@@ -150,6 +150,10 @@ pub struct Settings {
     pub ring_excluded: Vec<String>,
     /// Quick actions in the ring (their `action:…` keys), after the tools.
     pub ring_actions: Vec<String>,
+    /// Record what is copied (剪贴板历史).
+    pub clipboard_history: bool,
+    /// Global hotkey that opens 剪贴板历史; empty for none.
+    pub clipboard_hotkey: String,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
     /// Pop the ring up around the mouse pointer instead of in the bottom-right corner.
@@ -312,6 +316,8 @@ impl Default for Settings {
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
             ring_actions: Vec::new(),
+            clipboard_history: true,
+            clipboard_hotkey: "Alt+Shift+V".into(),
             ring_bounce: 2,
             ring_at_cursor: false,
             wallpaper: Wallpaper::default(),
@@ -337,6 +343,16 @@ pub struct Config {
     pub history: Vec<HistoryEntry>,
     /// Ids of favourite tools in the order shown (sorted separately from 全部工具).
     pub favorite_order: Vec<String>,
+    /// 文本片段: text pasted from the launcher, with {date} {time} … filled in.
+    pub snippets: Vec<Snippet>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snippet {
+    pub id: String,
+    pub name: String,
+    pub text: String,
 }
 
 impl Default for Config {
@@ -349,6 +365,7 @@ impl Default for Config {
             projects: Vec::new(),
             history: Vec::new(),
             favorite_order: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 }
