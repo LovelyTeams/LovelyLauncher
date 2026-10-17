@@ -304,10 +304,10 @@ pub fn listen(tx: UnboundedSender<Copied>) {
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
-        if ENABLED.load(Ordering::Relaxed) {
-            if let (Some(copied), Some(tx)) = (read(hwnd), SENDER.get()) {
-                let _ = tx.unbounded_send(copied);
-            }
+        if ENABLED.load(Ordering::Relaxed)
+            && let (Some(copied), Some(tx)) = (read(hwnd), SENDER.get())
+        {
+            let _ = tx.unbounded_send(copied);
         }
         return LRESULT(0);
     }

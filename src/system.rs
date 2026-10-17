@@ -29,6 +29,8 @@ pub enum AppEvent {
     Action(crate::launcher::QuickAction),
     /// The 剪贴板历史 hotkey.
     ClipboardHotkey,
+    /// Something to do with the selected text (picked in the text ring).
+    TextAction(crate::launcher::TextAction),
 }
 
 pub struct HotkeyService {

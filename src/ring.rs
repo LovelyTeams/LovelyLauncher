@@ -142,6 +142,8 @@ pub struct Ring {
     bounce: Bounce,
     /// The app's mascot, shown in the centre while nothing is pointed at.
     logo: Option<Arc<RenderImage>>,
+    /// The text ring: the selected text, quoted in the middle.
+    text: Option<SharedString>,
 }
 
 /// `a` blended towards `b` by `t`, as an opaque colour.
@@ -183,11 +185,24 @@ impl Ring {
             selected: None,
             bounce: Bounce::level(2),
             logo: None,
+            text: None,
         }
     }
 
     /// Pop the ring up in the corner of the monitor under the cursor.
-    pub fn open(&mut self, items: Vec<RingItem>, logo: Arc<RenderImage>, bounce: u8, at_cursor: bool, cx: &mut Context<Self>) {
+    /// Pop up with `items`; with `text`, as the text ring (other colour, the text in
+    /// the middle, at the pointer).
+    pub fn open(
+        &mut self,
+        items: Vec<RingItem>,
+        logo: Arc<RenderImage>,
+        bounce: u8,
+        at_cursor: bool,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let at_cursor = at_cursor || text.is_some();
+        self.text = text.map(|t| excerpt(&t, 46).into());
         let b = Bounce::level(bounce);
         self.bounce = b;
         let now = Instant::now();
@@ -332,20 +347,33 @@ impl Ring {
             return;
         };
         self.close(cx);
-        match crate::launcher::QuickAction::from_key(&id) {
-            // Actions need the launcher's own window: hand them over.
-            Some(action) => {
-                let _ = cx.global::<crate::system::AppEvents>().0.unbounded_send(crate::system::AppEvent::Action(action));
-            }
-            None => {
-                self.launcher.update(cx, |launcher, cx| launcher.launch_tool(&id, cx)).ok();
-            }
+        // Actions need the launcher's own window: hand them over.
+        let events = cx.global::<crate::system::AppEvents>().0.clone();
+        if let Some(action) = crate::launcher::TextAction::from_key(&id) {
+            let _ = events.unbounded_send(crate::system::AppEvent::TextAction(action));
+        } else if let Some(action) = crate::launcher::QuickAction::from_key(&id) {
+            let _ = events.unbounded_send(crate::system::AppEvent::Action(action));
+        } else {
+            self.launcher.update(cx, |launcher, cx| launcher.launch_tool(&id, cx)).ok();
         }
     }
 
     fn tile(&self, visual: &Visual, size: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.launcher.update(cx, |launcher, cx| launcher.tile(visual, size, size * 0.56, theme, cx)).ok()
     }
+}
+
+/// Colour of the text ring.
+const TEXT_ACCENT: gpui::Hsla = gpui::Hsla { h: 250. / 360., s: 0.62, l: 0.62, a: 1. };
+
+/// The start of `text` on one line, at most `max` characters.
+fn excerpt(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(max).collect();
+    if flat.chars().count() > max {
+        out.push('…');
+    }
+    out
 }
 
 /// `el` (a `size`-px square) absolutely positioned with its centre on (`x`, `y`).
@@ -400,7 +428,8 @@ impl Render for Ring {
         let theme = Theme::get(cx).clone();
         let (sx, sy) = (s * (1. + self.squash.x), s * (1. - self.squash.x));
         let c = CENTER;
-        let accent = theme.accent;
+        // The text ring is blue-violet, so it is not mistaken for the tool ring.
+        let accent = if self.text.is_some() { TEXT_ACCENT } else { theme.accent };
         let mut layers: Vec<AnyElement> = Vec::new();
 
         let white = |a: f32| hsla(0., 0., 1., a);
@@ -477,7 +506,37 @@ impl Render for Ring {
             Some((visual, name)) => {
                 let size = 62. * s * pop;
                 let tile = self.tile(&visual, size, &theme, cx).map(|t| place(t, c, c - 20., size));
-                (tile, name, "松开 Alt 打开".into())
+                (tile, name, if self.text.is_some() { "松开 Alt 执行" } else { "松开 Alt 打开" }.into())
+            }
+            None if self.text.is_some() => {
+                // The selected text, quoted.
+                let quote = self.text.clone().unwrap_or_default();
+                let fade = ((s - 0.8) / 0.2).clamp(0., 1.);
+                let block = div()
+                    .absolute()
+                    .left(px(c - 62.))
+                    .top(px(c - 44.))
+                    .w(px(124.))
+                    .h(px(70.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(2.))
+                    .opacity(fade)
+                    .child(div().text_size(px(20.)).line_height(px(16.)).text_color(accent).child("“"))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(theme.text)
+                            .text_center()
+                            .line_clamp(3)
+                            .child(quote),
+                    )
+                    .into_any_element();
+                (Some(block), SharedString::default(), "指向操作 · 松开 Alt".into())
             }
             None => {
                 let size = 76. * s * pop;

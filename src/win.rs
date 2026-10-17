@@ -502,6 +502,114 @@ pub fn cursor_in_window(raw: isize) -> Option<(f32, f32)> {
     Some(((cursor.x - rect.left) as f32 / scale, (cursor.y - rect.top) as f32 / scale))
 }
 
+/// The text selected in the focused control of the window in front, without
+/// touching the clipboard or sending keys: through UI Automation, or for classic
+/// edit controls (Notepad, many dialogs) by asking the control. `None` when nothing
+/// is selected or the program does not say. Blocking: call it off the UI thread.
+pub fn selected_text() -> Option<String> {
+    let text = automation_selection().or_else(edit_selection)?;
+    // RichEdit and UI Automation use a lone \r for line breaks.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Longer selections are cut; they go into an AI prompt at most.
+const MAX_SELECTION: usize = 20_000;
+
+fn automation_selection() -> Option<String> {
+    use windows::Win32::{
+        System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx},
+        UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId},
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+        let element = automation.GetFocusedElement().ok()?;
+        if element.CurrentProcessId().ok()? as u32 == std::process::id() {
+            return None;
+        }
+        let pattern: IUIAutomationTextPattern = element.GetCurrentPatternAs(UIA_TextPatternId).ok()?;
+        let ranges = pattern.GetSelection().ok()?;
+        let mut text = String::new();
+        for i in 0..ranges.Length().ok()? {
+            let piece = ranges.GetElement(i).ok()?.GetText(MAX_SELECTION as i32).ok()?;
+            text.push_str(&piece.to_string());
+        }
+        // Some controls answer with nothing rather than no: ask the control itself then.
+        (!text.trim().is_empty()).then_some(text)
+    }
+}
+
+/// The selection of a focused Edit / RichEdit control in another program
+/// (EM_GETSEL and WM_GETTEXT are passed between processes by Windows).
+fn edit_selection() -> Option<String> {
+    use windows::Win32::{
+        Foundation::{LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{
+            GUITHREADINFO, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, SMTO_ABORTIFHUNG,
+            SendMessageTimeoutW,
+        },
+    };
+    const EM_GETSEL: u32 = 0x00B0;
+    const WM_GETTEXTLENGTH: u32 = 0x000E;
+    const WM_GETTEXT: u32 = 0x000D;
+    unsafe {
+        let fg = GetForegroundWindow();
+        let mut pid = 0u32;
+        let thread = GetWindowThreadProcessId(fg, Some(&mut pid));
+        if thread == 0 || pid == std::process::id() {
+            return None;
+        }
+        let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        GetGUIThreadInfo(thread, &mut info).ok()?;
+        let focus = info.hwndFocus;
+        if focus.0.is_null() {
+            return None;
+        }
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(focus, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]).to_ascii_lowercase();
+        let rich = class.contains("richedit");
+        if !(rich || class == "edit") {
+            return None;
+        }
+        let send = |msg: u32, w: usize, l: isize| -> Option<usize> {
+            let mut result = 0usize;
+            let ok = SendMessageTimeoutW(focus, msg, WPARAM(w), LPARAM(l), SMTO_ABORTIFHUNG, 300, Some(&mut result));
+            (ok.0 != 0).then_some(result)
+        };
+        // Start and end packed in the result (good for the first 64K characters).
+        let packed = send(EM_GETSEL, 0, 0)?;
+        let (start, end) = (packed & 0xFFFF, (packed >> 16) & 0xFFFF);
+        if start >= end {
+            return None;
+        }
+        let len = send(WM_GETTEXTLENGTH, 0, 0)?;
+        if len == 0 || len > 4_000_000 {
+            return None;
+        }
+        let mut buf = vec![0u16; len + 1];
+        let got = send(WM_GETTEXT, buf.len(), buf.as_mut_ptr() as isize)?;
+        buf.truncate(got.min(len));
+        // RichEdit counts a line break as one character; WM_GETTEXT gives "\r\n".
+        let units: Vec<u16> = if rich {
+            let mut out = Vec::with_capacity(buf.len());
+            let mut i = 0;
+            while i < buf.len() {
+                out.push(buf[i]);
+                i += if buf[i] == 13 && buf.get(i + 1) == Some(&10) { 2 } else { 1 };
+            }
+            out
+        } else {
+            buf
+        };
+        let piece = units.get(start..end.min(units.len()))?;
+        let text = String::from_utf16_lossy(piece);
+        Some(text.chars().take(MAX_SELECTION).collect())
+    }
+}
+
 /// The window in front, unless it is one of ours.
 pub fn foreign_foreground_window() -> Option<isize> {
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
@@ -1196,6 +1304,15 @@ mod tests {
         assert_eq!(split_command("ms-settings:display"), None);
         assert_eq!(split_command("https://example.com/a b"), None);
         assert_eq!(split_command("no-such-program --flag"), None);
+    }
+
+    /// Select some text in a program in front first: `cargo test selected_text_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn selected_text_live() {
+        let text = std::thread::spawn(selected_text).join().unwrap();
+        println!("selected: {text:?}");
+        assert!(text.is_some());
     }
 
     #[test]

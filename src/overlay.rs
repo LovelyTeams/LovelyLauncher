@@ -179,10 +179,10 @@ impl Overlay {
     fn on_move(&mut self, e: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         let (x, y) = self.to_screen(e.position, window);
         self.mouse = Some((x, y));
-        if self.dragging {
-            if let Some((start, _)) = self.drag {
-                self.drag = Some((start, (x, y)));
-            }
+        if self.dragging
+            && let Some((start, _)) = self.drag
+        {
+            self.drag = Some((start, (x, y)));
         }
         cx.notify();
     }

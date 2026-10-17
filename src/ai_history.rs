@@ -21,6 +21,8 @@ pub struct Conversation {
     pub provider: String,
     pub model: String,
     pub question: String,
+    /// What was really sent, when longer than the question (selected text attached).
+    pub prompt: String,
     /// Markdown, as streamed.
     pub answer: String,
 }

@@ -157,6 +157,87 @@ impl QuickAction {
     }
 }
 
+/// What can be done with the selected text, from the text ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAction {
+    Copy,
+    Translate,
+    Explain,
+    Summarize,
+    Search,
+    Snippet,
+    Open,
+}
+
+impl TextAction {
+    const ALL: [TextAction; 7] = [
+        TextAction::Translate,
+        TextAction::Explain,
+        TextAction::Summarize,
+        TextAction::Search,
+        TextAction::Copy,
+        TextAction::Snippet,
+        TextAction::Open,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextAction::Copy => "复制",
+            TextAction::Translate => "翻译",
+            TextAction::Explain => "解释",
+            TextAction::Summarize => "总结",
+            TextAction::Search => "搜索",
+            TextAction::Snippet => "存为片段",
+            TextAction::Open => "打开",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            TextAction::Copy => "copy",
+            TextAction::Translate => "languages",
+            TextAction::Explain => "sparkles",
+            TextAction::Summarize => "list",
+            TextAction::Search => "search",
+            TextAction::Snippet => "type",
+            TextAction::Open => "external",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            TextAction::Copy => "text:copy",
+            TextAction::Translate => "text:translate",
+            TextAction::Explain => "text:explain",
+            TextAction::Summarize => "text:summarize",
+            TextAction::Search => "text:search",
+            TextAction::Snippet => "text:snippet",
+            TextAction::Open => "text:open",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.key() == key)
+    }
+
+    /// The AI prompt, for the actions that ask AI.
+    fn prompt(self, text: &str) -> Option<String> {
+        let ask = match self {
+            TextAction::Translate => "请翻译下面的内容：原文是中文就译成英文，否则译成中文。只输出译文，不要解释。",
+            TextAction::Explain => "请用简洁的中文解释下面的内容；如果是代码，说明它做什么。",
+            TextAction::Summarize => "请用中文简要总结下面内容的要点，用简短的列表。",
+            _ => return None,
+        };
+        Some(format!("{ask}\n\n{text}"))
+    }
+
+    /// The actions offered for `text`: 打开 only for a link or an existing path.
+    fn for_text(text: &str) -> Vec<TextAction> {
+        let openable = looks_like_url(text) || (text.len() < 400 && Path::new(text.trim().trim_matches('"')).exists());
+        Self::ALL.into_iter().filter(|a| *a != TextAction::Open || openable).collect()
+    }
+}
+
 /// `cb` or `cb …` in the search box: what to filter 剪贴板历史 by.
 fn clipboard_filter(query: &str) -> Option<&str> {
     let query = query.trim_start();
@@ -247,6 +328,9 @@ pub fn join_args(first: &str, second: &str) -> String {
         (a, b) => format!("{a} {b}"),
     }
 }
+
+/// Text copied this recently brings up the text ring when Alt is held.
+const RECENT_COPY: Duration = Duration::from_secs(4);
 
 /// How long Alt has to be held on its own before the ring pops up.
 const RING_HOLD: Duration = Duration::from_millis(300);
@@ -386,6 +470,8 @@ pub enum AiState {
 
 pub struct AiAnswer {
     pub question: String,
+    /// What is really sent when it differs from the question (text from the text ring).
+    pub prompt: Option<String>,
     pub provider_id: String,
     pub model: String,
     pub text: String,
@@ -463,6 +549,10 @@ pub struct Launcher {
     clips_save_generation: u64,
     /// The window that was in front before the launcher was called up: pastes go there.
     prev_foreground: Option<isize>,
+    /// Text selected when the text ring came up.
+    ring_text: Option<String>,
+    /// Text copied lately: holding Alt soon after brings up the text ring for it.
+    last_text_copy: Option<(std::time::Instant, String)>,
     pub(crate) update: UpdateState,
     pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
     /// The Alt ring popup, created on first use and then kept (hidden) for reuse.
@@ -583,6 +673,8 @@ impl Launcher {
             clips: crate::clipboard::load(),
             clips_save_generation: 0,
             prev_foreground: None,
+            ring_text: None,
+            last_text_copy: None,
             update: UpdateState::default(),
             preview: None,
             ring: None,
@@ -852,6 +944,7 @@ impl Launcher {
                 self.remember_foreground();
                 self.activate(Target::Action(action), false, window, cx)
             }
+            AppEvent::TextAction(action) => self.run_text_action(action, window, cx),
             AppEvent::ClipboardHotkey => {
                 self.remember_foreground();
                 self.open_clipboard_history(window, cx);
@@ -1245,6 +1338,9 @@ impl Launcher {
     }
 
     fn on_copied(&mut self, copied: crate::clipboard::Copied, cx: &mut Context<Self>) {
+        if let crate::clipboard::Copied::Text(text) = &copied {
+            self.last_text_copy = Some((std::time::Instant::now(), text.clone()));
+        }
         let dropped = crate::clipboard::remember(&mut self.clips, copied, now_secs());
         if !dropped.is_empty() {
             cx.background_spawn(async move { crate::clipboard::delete_images(&dropped) }).detach();
@@ -1272,6 +1368,40 @@ impl Launcher {
             }
         })
         .detach();
+    }
+
+    /// Do `action` with the text selected when the text ring came up.
+    pub fn run_text_action(&mut self, action: TextAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.ring_text.clone() else { return };
+        match action {
+            TextAction::Copy => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+            TextAction::Search => {
+                let query: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+                self.activate(Target::WebSearch(query), false, window, cx);
+            }
+            TextAction::Open => {
+                let target = text.trim().trim_matches('"').to_string();
+                if looks_like_url(&target) {
+                    self.activate(Target::Url(normalize_url(&target)), false, window, cx);
+                } else {
+                    self.spawn_launch(target, String::new(), String::new(), false, cx);
+                }
+            }
+            TextAction::Snippet => {
+                self.show(window, cx);
+                self.open_snippet_editor(None, Some(text), false, window, cx);
+            }
+            TextAction::Translate | TextAction::Explain | TextAction::Summarize => {
+                let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut short: String = flat.chars().take(24).collect();
+                if flat.chars().count() > 24 {
+                    short.push('…');
+                }
+                if let Some(prompt) = action.prompt(&text) {
+                    self.ask_ai_about(format!("{}：{short}", action.label()), prompt, window, cx);
+                }
+            }
+        }
     }
 
     /// Remember the window in front (not ours) so a paste can go back to it.
@@ -1490,11 +1620,34 @@ impl Launcher {
             HookEvent::AltDown => {
                 self.ring_seq += 1;
                 let seq = self.ring_seq;
+                // While Alt is held, find out whether text is selected: that brings up
+                // the text ring instead of the tools. On its own thread, as UI Automation
+                // talks to the other program and may take a moment.
+                let (tx, rx) = futures::channel::oneshot::channel();
+                std::thread::Builder::new()
+                    .name("selection".into())
+                    .spawn(move || {
+                        let _ = tx.send(win::selected_text());
+                    })
+                    .ok();
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(RING_HOLD).await;
+                    let wait = Box::pin(cx.background_executor().timer(Duration::from_millis(250)));
+                    let text = match futures::future::select(rx, wait).await {
+                        futures::future::Either::Left((Ok(text), _)) => text,
+                        _ => None,
+                    };
                     this.update(cx, |this, cx| {
                         if this.ring_seq == seq {
-                            this.show_ring(cx);
+                            // Nothing selected that we can read: text copied a moment ago will do.
+                            let text = text.or_else(|| {
+                                this.last_text_copy
+                                    .take()
+                                    .filter(|(at, _)| at.elapsed() < RECENT_COPY)
+                                    .map(|(_, t)| t.trim().to_string())
+                                    .filter(|t| !t.is_empty())
+                            });
+                            this.show_ring(text, cx);
                         }
                     })
                     .ok();
@@ -1511,9 +1664,12 @@ impl Launcher {
                 self.ring_seq += 1;
                 let chosen = self.ring.and_then(|ring| ring.update(cx, |ring, _, cx| ring.release(cx)).ok().flatten());
                 if let Some(id) = chosen {
-                    match QuickAction::from_key(&id) {
-                        Some(action) => self.activate(Target::Action(action), false, window, cx),
-                        None => self.launch_tool(&id, cx),
+                    if let Some(action) = TextAction::from_key(&id) {
+                        self.run_text_action(action, window, cx);
+                    } else if let Some(action) = QuickAction::from_key(&id) {
+                        self.activate(Target::Action(action), false, window, cx);
+                    } else {
+                        self.launch_tool(&id, cx);
                     }
                 }
             }
@@ -1569,7 +1725,7 @@ impl Launcher {
     }
 
     /// Alt has been held on its own long enough: pop up the ring of tools.
-    fn show_ring(&mut self, cx: &mut Context<Self>) {
+    fn show_ring(&mut self, text: Option<String>, cx: &mut Context<Self>) {
         // Holding Alt is often part of playing a game: stay out of the way.
         if self.config.settings.ring_skip_fullscreen && win::fullscreen_app_in_front() {
             return;
@@ -1582,13 +1738,24 @@ impl Launcher {
                 }
             }
         }
-        let items = self.ring_items();
+        let items = match &text {
+            Some(t) => TextAction::for_text(t)
+                .into_iter()
+                .map(|a| crate::ring::RingItem {
+                    id: a.key().to_string(),
+                    name: a.label().into(),
+                    visual: Visual::Glyph { icon: a.icon(), tint: "purple".into() },
+                })
+                .collect(),
+            None => self.ring_items(),
+        };
+        self.ring_text = text.clone();
         // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
         win::send_mask_key();
         if let Some(ring) = self.ring {
             let (logo, bounce, at_cursor) =
                 (self.logo.clone(), self.config.settings.ring_bounce, self.config.settings.ring_at_cursor);
-            if ring.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, cx)).is_ok() {
+            if ring.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, text, cx)).is_ok() {
                 return;
             }
             self.ring = None;
@@ -1617,7 +1784,7 @@ impl Launcher {
                 self.ring = Some(handle);
                 let (logo, bounce, at_cursor) =
                 (self.logo.clone(), self.config.settings.ring_bounce, self.config.settings.ring_at_cursor);
-                handle.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, cx)).ok();
+                handle.update(cx, |ring, _, cx| ring.open(items, logo, bounce, at_cursor, text, cx)).ok();
             }
             Err(err) => self.show_toast(format!("无法显示圆环菜单：{err}"), true, cx),
         }
@@ -1983,12 +2150,46 @@ impl Launcher {
         if question.is_empty() {
             return;
         }
+        // Asked about selected text: the box shows a short question, the prompt has the text.
+        let prompt = self
+            .ai
+            .as_ref()
+            .filter(|a| a.question == question)
+            .and_then(|a| a.prompt.clone())
+            .unwrap_or_else(|| question.clone());
+        self.run_ai(provider, question, prompt, cx);
+    }
+
+    /// Ask AI about the selected text: the search box shows `label`, `prompt` is sent.
+    pub fn ask_ai_about(&mut self, label: String, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.config.settings.active_ai().cloned() else {
+            self.show_toast("还没有配置 AI 服务商，请在 设置 → AI 助手 中添加", true, cx);
+            return;
+        };
+        self.dialog = None;
+        if !self.hwnd.is_some_and(win::is_window_visible) {
+            if self.config.settings.mini_on_hotkey {
+                self.show_mini(window, cx);
+            } else {
+                self.show(window, cx);
+            }
+        }
+        self.ai_history_open = false;
+        let query = format!("@ai {label}");
+        self.search_text = query.clone();
+        self.search.update(cx, |input, cx| input.set_text(query, cx));
+        window.focus(&self.search.focus_handle(cx));
+        self.run_ai(provider, label, prompt, cx);
+    }
+
+    fn run_ai(&mut self, provider: crate::config::AiProvider, question: String, prompt: String, cx: &mut Context<Self>) {
         if let Some(previous) = &self.ai {
             previous.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.ai = Some(AiAnswer {
             question: question.clone(),
+            prompt: (prompt != question).then(|| prompt.clone()),
             provider_id: provider.id.clone(),
             model: provider.model.clone(),
             text: String::new(),
@@ -2005,7 +2206,7 @@ impl Launcher {
         std::thread::Builder::new()
             .name("ai".into())
             .spawn(move || {
-                let result = crate::ai::ask(&provider, &question, &thread_cancel, |text| {
+                let result = crate::ai::ask(&provider, &prompt, &thread_cancel, |text| {
                     let _ = tx.unbounded_send(AiMsg::Text(text.to_string()));
                 });
                 let _ = tx.unbounded_send(AiMsg::Finished(result));
@@ -2091,6 +2292,7 @@ impl Launcher {
             provider,
             model: answer.model.clone(),
             question: answer.question.clone(),
+            prompt: answer.prompt.clone().unwrap_or_default(),
             answer: answer.text.clone(),
         };
         let list = self.ai_history_mut();
@@ -2152,6 +2354,7 @@ impl Launcher {
         }
         self.ai = Some(AiAnswer {
             question: c.question.clone(),
+            prompt: (!c.prompt.is_empty()).then(|| c.prompt.clone()),
             provider_id,
             model: c.model,
             text: c.answer,
