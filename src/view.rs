@@ -1213,7 +1213,7 @@ impl Launcher {
         let m = self.metrics;
         let in_ring = self.ring_actions();
         let mut cells = Vec::new();
-        for (ix, action) in QuickAction::ALL.into_iter().enumerate() {
+        for (ix, action) in self.quick_actions().into_iter().enumerate() {
             let tip: SharedString = format!("{} · 右键可加入圆环", action.keys().join(" + ")).into();
             let group: SharedString = format!("action-{ix}").into();
             cells.push(

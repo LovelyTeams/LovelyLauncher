@@ -1289,13 +1289,14 @@ impl Launcher {
             }
         }
 
-        for snippet in &self.config.snippets {
+        let snippets = if self.config.settings.snippets_enabled { self.config.snippets.as_slice() } else { &[] };
+        for snippet in snippets {
             if let Some(score) = SearchKey::new(&snippet.name).score(&q) {
                 items.push(snippet_item(snippet, score));
             }
         }
 
-        for action in QuickAction::ALL {
+        for action in self.quick_actions() {
             if let Some(score) = SearchKey::new(action.label()).score(&q) {
                 items.push(ResultItem {
                     target: Target::Action(action),
@@ -1456,7 +1457,8 @@ impl Launcher {
                 score: 0,
             });
         }
-        for snippet in &self.config.snippets {
+        let snippets = if self.config.settings.snippets_enabled { self.config.snippets.as_slice() } else { &[] };
+        for snippet in snippets {
             let text = format!("{}\n{}", snippet.name, snippet.text).to_lowercase();
             if filter.split_whitespace().all(|w| text.contains(w)) {
                 items.push(snippet_item(snippet, 0));
@@ -1633,12 +1635,16 @@ impl Launcher {
                 // the text ring instead of the tools. On its own thread, as UI Automation
                 // talks to the other program and may take a moment.
                 let (tx, rx) = futures::channel::oneshot::channel();
-                std::thread::Builder::new()
-                    .name("selection".into())
-                    .spawn(move || {
-                        let _ = tx.send(win::selected_text());
-                    })
-                    .ok();
+                if self.config.settings.text_ring {
+                    std::thread::Builder::new()
+                        .name("selection".into())
+                        .spawn(move || {
+                            let _ = tx.send(win::selected_text());
+                        })
+                        .ok();
+                } else {
+                    let _ = tx.send(None);
+                }
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(RING_HOLD).await;
                     let wait = Box::pin(cx.background_executor().timer(Duration::from_millis(250)));
@@ -1649,9 +1655,12 @@ impl Launcher {
                     this.update(cx, |this, cx| {
                         if this.ring_seq == seq {
                             // Nothing selected that we can read: text copied a moment ago will do.
+                            let settings = &this.config.settings;
+                            let after_copy = settings.text_ring && settings.text_ring_after_copy;
                             let text = text.or_else(|| {
                                 this.last_text_copy
                                     .take()
+                                    .filter(|_| after_copy)
                                     .filter(|(at, _)| at.elapsed() < RECENT_COPY)
                                     .map(|(_, t)| t.trim().to_string())
                                     .filter(|t| !t.is_empty())
@@ -1685,9 +1694,30 @@ impl Launcher {
         }
     }
 
-    /// Quick actions put in the ring.
+    /// Whether a quick action is switched on in the settings.
+    pub fn action_enabled(&self, action: QuickAction) -> bool {
+        let settings = &self.config.settings;
+        match action {
+            QuickAction::ColorPicker => settings.color_picker,
+            QuickAction::Ruler => settings.ruler,
+            _ => true,
+        }
+    }
+
+    /// The quick actions that are switched on, in their usual order.
+    pub fn quick_actions(&self) -> Vec<QuickAction> {
+        QuickAction::ALL.into_iter().filter(|a| self.action_enabled(*a)).collect()
+    }
+
+    /// Quick actions put in the ring (and switched on).
     pub fn ring_actions(&self) -> Vec<QuickAction> {
-        self.config.settings.ring_actions.iter().filter_map(|k| QuickAction::from_key(k)).collect()
+        self.config
+            .settings
+            .ring_actions
+            .iter()
+            .filter_map(|k| QuickAction::from_key(k))
+            .filter(|a| self.action_enabled(*a))
+            .collect()
     }
 
     /// Tools and actions the user put in the ring.
@@ -1697,7 +1727,7 @@ impl Launcher {
 
     /// What the ring shows: the chosen tools (or the most used ones), then the chosen actions.
     fn ring_items(&self) -> Vec<crate::ring::RingItem> {
-        let actions = self.ring_actions();
+        let actions = if self.config.settings.ring_show_actions { self.ring_actions() } else { Vec::new() };
         let room = crate::ring::MAX_ITEMS.saturating_sub(actions.len());
         let tools = pick_ring_tools(&self.config.tools, &self.config.history, room);
         tools
@@ -2775,6 +2805,10 @@ impl Launcher {
 
     /// Returns whether the window should hide afterwards.
     fn run_action(&mut self, action: QuickAction, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Switched off in the settings: its shortcut does nothing either.
+        if !self.action_enabled(action) {
+            return false;
+        }
         match action {
             QuickAction::NewTerminal => {
                 self.spawn_launch(self.terminal(), String::new(), home_dir(), false, cx);

@@ -605,6 +605,31 @@ impl Launcher {
                     .text_color(theme.text_faint)
                     .child("常用的签名、地址、模板：在搜索框输入名称或 cb 就能找到，Enter 粘贴。剪贴板历史里的文字也可以右键“存为文本片段”。"),
             )
+            .child(
+                div()
+                    .id("snippets-enabled")
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .py(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.snippets_enabled = !this.config.settings.snippets_enabled;
+                        this.config.save();
+                        this.refresh_results();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.5)).child("启用文本片段"))
+                            .child(div().text_size(px(12.)).text_color(theme.text_faint).child("关闭后搜索和剪贴板历史里不再出现片段，已有的片段会保留")),
+                    )
+                    .child(switch("snippets-enabled-switch", settings.snippets_enabled, theme)),
+            )
             .when(self.config.snippets.is_empty(), |d| {
                 d.child(div().py(px(10.)).text_size(px(12.5)).text_color(theme.text_faint).child("还没有文本片段"))
             })
@@ -2471,6 +2496,50 @@ impl Launcher {
                 )
                 .child(
                     toggle(
+                        "ring-show-actions",
+                        "圆环里显示快捷操作",
+                        "在“快捷操作”里右键加入圆环的操作（截图、取色器等）排在工具后面",
+                        settings.ring_show_actions,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.ring_show_actions = !this.config.settings.ring_show_actions;
+                        this.config.save();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    toggle(
+                        "text-ring",
+                        "选中文字时弹出划词圆环",
+                        "先选中一段文字再按住 Alt：在鼠标旁弹出蓝紫色的圆环，可以翻译、解释、总结、搜索、复制",
+                        settings.text_ring,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.text_ring = !this.config.settings.text_ring;
+                        this.config.save();
+                        cx.notify();
+                    })),
+                )
+                .when(settings.text_ring, |d| {
+                    d.child(
+                        toggle(
+                            "text-ring-copy",
+                            "复制文字后按住 Alt 也弹出划词圆环",
+                            "读不到选中文字的程序里（比如微信、QQ），先 Ctrl+C 再在 4 秒内按住 Alt",
+                            settings.text_ring_after_copy,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.config.settings.text_ring_after_copy = !this.config.settings.text_ring_after_copy;
+                            this.config.save();
+                            cx.notify();
+                        })),
+                    )
+                })
+                .child(
+                    toggle(
                         "ring-fullscreen",
                         "全屏游戏、全屏视频时不弹出",
                         "前台是全屏程序（含无边框全屏游戏）时不弹出，打游戏不会误触",
@@ -2533,6 +2602,25 @@ impl Launcher {
                         this.config.save();
                         cx.notify();
                     })),
+            )
+            .child(section("快捷操作"))
+            .child(
+                toggle("color-picker", "取色器", "Ctrl+Shift+C：放大镜取屏幕上的颜色，单击复制 HEX", settings.color_picker, theme).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.color_picker = !this.config.settings.color_picker;
+                        this.config.save();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                toggle("ruler", "屏幕标尺", "Ctrl+Shift+R：量屏幕上的距离和矩形大小（屏幕像素）", settings.ruler, theme).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.ruler = !this.config.settings.ruler;
+                        this.config.save();
+                        cx.notify();
+                    }),
+                ),
             )
             .child(section("终端"))
             .child(

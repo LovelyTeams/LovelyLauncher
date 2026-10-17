@@ -150,10 +150,22 @@ pub struct Settings {
     pub ring_excluded: Vec<String>,
     /// Quick actions in the ring (their `action:…` keys), after the tools.
     pub ring_actions: Vec<String>,
+    /// Show those quick actions in the ring.
+    pub ring_show_actions: bool,
+    /// Holding Alt over selected text brings up the text ring.
+    pub text_ring: bool,
+    /// …and over text copied a moment ago.
+    pub text_ring_after_copy: bool,
+    /// 取色器 among the quick actions.
+    pub color_picker: bool,
+    /// 屏幕标尺 among the quick actions.
+    pub ruler: bool,
     /// Record what is copied (剪贴板历史).
     pub clipboard_history: bool,
     /// Global hotkey that opens 剪贴板历史; empty for none.
     pub clipboard_hotkey: String,
+    /// 文本片段 show up in search and in 剪贴板历史.
+    pub snippets_enabled: bool,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
     /// Pop the ring up around the mouse pointer instead of in the bottom-right corner.
@@ -316,8 +328,14 @@ impl Default for Settings {
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
             ring_actions: Vec::new(),
+            ring_show_actions: true,
+            text_ring: true,
+            text_ring_after_copy: true,
+            color_picker: true,
+            ruler: true,
             clipboard_history: true,
             clipboard_hotkey: "Alt+Shift+V".into(),
+            snippets_enabled: true,
             ring_bounce: 2,
             ring_at_cursor: false,
             wallpaper: Wallpaper::default(),
