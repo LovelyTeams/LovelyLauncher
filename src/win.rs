@@ -1277,6 +1277,38 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// Whether this process runs below medium integrity: started from a folder marked
+/// "low" (some sandboxes mark working folders so). Windows then keeps it from the
+/// tray, from other programs' windows and from their keyboard input.
+pub fn low_integrity() -> bool {
+    use windows::Win32::{
+        Security::{GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    const MEDIUM: u32 = 0x2000;
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), len, &mut len).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        if !ok || buf.len() < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+            return false;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid) as u32;
+        if count == 0 {
+            return false;
+        }
+        *GetSidSubAuthority(sid, count - 1) < MEDIUM
+    }
+}
+
 pub fn is_autostart() -> bool {
     windows_registry::CURRENT_USER
         .open(RUN_KEY)
@@ -1313,6 +1345,13 @@ mod tests {
         let text = std::thread::spawn(selected_text).join().unwrap();
         println!("selected: {text:?}");
         assert!(text.is_some());
+    }
+
+    /// `cargo test low_integrity_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn low_integrity_live() {
+        println!("low integrity: {}", low_integrity());
     }
 
     #[test]

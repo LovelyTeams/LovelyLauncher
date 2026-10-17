@@ -707,7 +707,16 @@ impl Launcher {
         };
         this.apply_theme(window, cx);
         window.focus(&this.search.focus_handle(cx));
-        if let Some(err) = hotkey_error {
+        if win::low_integrity() {
+            // Started from a folder marked "low": no tray icon, and the hooks can't see
+            // other programs. Say so in the window, as there is no other way in.
+            this.show(window, cx);
+            this.show_toast(
+                "LovelyLauncher 正以低权限运行（所在文件夹被标记为“低完整性”），托盘图标、圆环和粘贴都会失效。请把程序复制到其他文件夹再运行。",
+                true,
+                cx,
+            );
+        } else if let Some(err) = hotkey_error {
             this.show_toast(err, true, cx);
         } else if updated {
             this.show_toast(format!("已更新到 v{}", crate::update::CURRENT_VERSION), false, cx);
