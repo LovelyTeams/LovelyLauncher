@@ -265,6 +265,12 @@ fn capture_monitors() -> Vec<Capture> {
     rects.into_iter().filter_map(capture_rect).collect()
 }
 
+/// Screen pixels of (left, top, right, bottom): (width, height, BGRA).
+pub fn capture_area(rect: (i32, i32, i32, i32)) -> Option<(u32, u32, Vec<u8>)> {
+    let (left, top, right, bottom) = rect;
+    capture_rect(RECT { left, top, right, bottom }).map(|c| (c.width, c.height, c.bgra))
+}
+
 fn capture_rect(r: RECT) -> Option<Capture> {
     let (w, h) = ((r.right - r.left).max(0), (r.bottom - r.top).max(0));
     if w == 0 || h == 0 {

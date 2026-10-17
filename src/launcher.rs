@@ -39,6 +39,8 @@ actions!(
         TakeScreenshot,
         ScanCode,
         QuickNote,
+        PickColor,
+        MeasureScreen,
         OpenSettings,
         AddTool,
         FocusNextField,
@@ -61,6 +63,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", TakeScreenshot, launcher),
         KeyBinding::new("ctrl-shift-q", ScanCode, launcher),
         KeyBinding::new("ctrl-n", QuickNote, launcher),
+        KeyBinding::new("ctrl-shift-c", PickColor, launcher),
+        KeyBinding::new("ctrl-shift-r", MeasureScreen, launcher),
         KeyBinding::new("ctrl-,", OpenSettings, launcher),
         KeyBinding::new("ctrl-d", AddTool, launcher),
         KeyBinding::new("tab", FocusNextField, dialog),
@@ -77,15 +81,19 @@ pub enum QuickAction {
     Screenshot,
     Scan,
     Note,
+    ColorPicker,
+    Ruler,
 }
 
 impl QuickAction {
-    pub const ALL: [QuickAction; 5] = [
+    pub const ALL: [QuickAction; 7] = [
         QuickAction::NewTerminal,
         QuickAction::OpenProject,
         QuickAction::Screenshot,
         QuickAction::Scan,
         QuickAction::Note,
+        QuickAction::ColorPicker,
+        QuickAction::Ruler,
     ];
 
     pub fn label(self) -> &'static str {
@@ -95,6 +103,8 @@ impl QuickAction {
             QuickAction::Screenshot => "截图",
             QuickAction::Scan => "快速扫码",
             QuickAction::Note => "快速笔记",
+            QuickAction::ColorPicker => "取色器",
+            QuickAction::Ruler => "屏幕标尺",
         }
     }
 
@@ -105,6 +115,8 @@ impl QuickAction {
             QuickAction::Screenshot => "scan",
             QuickAction::Scan => "qr",
             QuickAction::Note => "note",
+            QuickAction::ColorPicker => "pipette",
+            QuickAction::Ruler => "ruler",
         }
     }
 
@@ -115,6 +127,8 @@ impl QuickAction {
             QuickAction::Screenshot => &["Ctrl", "Shift", "S"],
             QuickAction::Scan => &["Ctrl", "Shift", "Q"],
             QuickAction::Note => &["Ctrl", "N"],
+            QuickAction::ColorPicker => &["Ctrl", "Shift", "C"],
+            QuickAction::Ruler => &["Ctrl", "Shift", "R"],
         }
     }
 
@@ -125,10 +139,12 @@ impl QuickAction {
             QuickAction::Screenshot => "action:screenshot",
             QuickAction::Scan => "action:scan",
             QuickAction::Note => "action:note",
+            QuickAction::ColorPicker => "action:color",
+            QuickAction::Ruler => "action:ruler",
         }
     }
 
-    fn from_key(key: &str) -> Option<Self> {
+    pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.key() == key)
     }
 }
@@ -354,6 +370,7 @@ pub enum MenuTarget {
     App(PathBuf),
     Project(String),
     History(String),
+    Action(QuickAction),
 }
 
 pub struct ContextMenu {
@@ -781,7 +798,8 @@ impl Launcher {
                 self.show(window, cx);
                 self.open_settings(window, cx);
             }
-            AppEvent::Preview(event) => self.handle_preview_event(event, cx),
+            AppEvent::Preview(event) => self.handle_preview_event(event, window, cx),
+            AppEvent::Action(action) => self.activate(Target::Action(action), false, window, cx),
             AppEvent::Quit => {
                 self.config.save();
                 cx.quit();
@@ -1156,7 +1174,7 @@ impl Launcher {
         self.preview.is_some_and(|h| h.update(cx, |_, _, _| ()).is_ok())
     }
 
-    fn handle_preview_event(&mut self, event: crate::preview::hook::HookEvent, cx: &mut Context<Self>) {
+    fn handle_preview_event(&mut self, event: crate::preview::hook::HookEvent, window: &mut Window, cx: &mut Context<Self>) {
         use crate::preview::hook::{self, HookEvent};
         match event {
             HookEvent::Toggle { hwnd } => {
@@ -1205,14 +1223,61 @@ impl Launcher {
                 self.ring_seq += 1;
                 let chosen = self.ring.and_then(|ring| ring.update(cx, |ring, _, cx| ring.release(cx)).ok().flatten());
                 if let Some(id) = chosen {
-                    self.launch_tool(&id, cx);
+                    match QuickAction::from_key(&id) {
+                        Some(action) => self.activate(Target::Action(action), false, window, cx),
+                        None => self.launch_tool(&id, cx),
+                    }
                 }
             }
         }
     }
 
-    fn ring_tools(&self) -> Vec<&crate::config::Tool> {
-        pick_ring_tools(&self.config.tools, &self.config.history, crate::ring::MAX_ITEMS)
+    /// Quick actions put in the ring.
+    pub fn ring_actions(&self) -> Vec<QuickAction> {
+        self.config.settings.ring_actions.iter().filter_map(|k| QuickAction::from_key(k)).collect()
+    }
+
+    /// Tools and actions the user put in the ring.
+    pub fn ring_count(&self) -> usize {
+        self.config.tools.iter().filter(|t| t.ring).count() + self.ring_actions().len()
+    }
+
+    /// What the ring shows: the chosen tools (or the most used ones), then the chosen actions.
+    fn ring_items(&self) -> Vec<crate::ring::RingItem> {
+        let actions = self.ring_actions();
+        let room = crate::ring::MAX_ITEMS.saturating_sub(actions.len());
+        let tools = pick_ring_tools(&self.config.tools, &self.config.history, room);
+        tools
+            .into_iter()
+            .map(|t| crate::ring::RingItem {
+                id: t.id.clone(),
+                name: t.name.clone().into(),
+                visual: Self::tool_visual(t),
+            })
+            .chain(actions.into_iter().map(|a| crate::ring::RingItem {
+                id: a.key().to_string(),
+                name: a.label().into(),
+                visual: Visual::Glyph { icon: a.icon(), tint: "pink".into() },
+            }))
+            .collect()
+    }
+
+    pub fn toggle_ring_action(&mut self, action: QuickAction, cx: &mut Context<Self>) {
+        let key = action.key().to_string();
+        let list = &mut self.config.settings.ring_actions;
+        if let Some(ix) = list.iter().position(|k| *k == key) {
+            list.remove(ix);
+            self.config.save();
+            self.show_toast(format!("已将“{}”移出圆环", action.label()), false, cx);
+            return;
+        }
+        if self.ring_count() >= crate::ring::MAX_ITEMS {
+            self.show_toast(format!("圆环最多放 {} 个，先移出一个吧", crate::ring::MAX_ITEMS), true, cx);
+            return;
+        }
+        self.config.settings.ring_actions.push(key);
+        self.config.save();
+        self.show_toast(format!("已将“{}”加入圆环", action.label()), false, cx);
     }
 
     /// Alt has been held on its own long enough: pop up the ring of tools.
@@ -1229,15 +1294,7 @@ impl Launcher {
                 }
             }
         }
-        let items: Vec<crate::ring::RingItem> = self
-            .ring_tools()
-            .into_iter()
-            .map(|t| crate::ring::RingItem {
-                id: t.id.clone(),
-                name: t.name.clone().into(),
-                visual: Self::tool_visual(t),
-            })
-            .collect();
+        let items = self.ring_items();
         // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
         win::send_mask_key();
         if let Some(ring) = self.ring {
@@ -2227,6 +2284,14 @@ impl Launcher {
                 self.start_scan(window, cx);
                 false
             }
+            QuickAction::ColorPicker => {
+                self.start_overlay(crate::overlay::Mode::Color, window, cx);
+                false
+            }
+            QuickAction::Ruler => {
+                self.start_overlay(crate::overlay::Mode::Ruler, window, cx);
+                false
+            }
             QuickAction::Note => {
                 let path = Config::dir().join("notes.md");
                 if !path.exists() {
@@ -2237,6 +2302,56 @@ impl Launcher {
                 true
             }
         }
+    }
+
+    /// 取色器 / 屏幕标尺: step aside, take a still of the monitor under the pointer and
+    /// cover it with that picture.
+    pub fn start_overlay(&mut self, mode: crate::overlay::Mode, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.hwnd.is_some_and(win::is_window_visible);
+        self.dialog = None;
+        self.hide(window, cx);
+        cx.spawn(async move |this, cx| {
+            // Let the launcher disappear before the screen is read.
+            if visible {
+                cx.background_executor().timer(Duration::from_millis(220)).await;
+            }
+            let shot = cx
+                .background_spawn(async {
+                    let rect = win::monitor_rect_at_cursor()?;
+                    let (width, height, bgra) = crate::scan::capture_area(rect)?;
+                    Some(crate::overlay::Shot { rect, width, height, bgra })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(shot) = shot else {
+                    this.show_toast("无法读取屏幕画面", true, cx);
+                    return;
+                };
+                let launcher = cx.weak_entity();
+                let options = gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        gpui::point(gpui::px(-10000.), gpui::px(-10000.)),
+                        gpui::size(gpui::px(400.), gpui::px(300.)),
+                    ))),
+                    titlebar: None,
+                    kind: gpui::WindowKind::PopUp,
+                    show: false,
+                    focus: true,
+                    is_movable: false,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    app_id: Some("LovelyLauncher".into()),
+                    ..Default::default()
+                };
+                if let Err(err) =
+                    cx.open_window(options, move |window, cx| cx.new(|cx| crate::overlay::Overlay::new(mode, shot, launcher, window, cx)))
+                {
+                    this.show_toast(format!("无法打开{}：{err}", if mode == crate::overlay::Mode::Color { "取色器" } else { "屏幕标尺" }), true, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 快速扫码: step aside, read the screens and the clipboard, then show what was found.
@@ -2348,7 +2463,7 @@ impl Launcher {
     }
 
     pub fn add_to_ring(&mut self, id: &str, cx: &mut Context<Self>) {
-        let count = self.config.tools.iter().filter(|t| t.ring).count();
+        let count = self.ring_count();
         let Some(tool) = self.config.tools.iter_mut().find(|t| t.id == id) else { return };
         if tool.ring {
             return;
@@ -2641,7 +2756,7 @@ impl Launcher {
             _ => String::new(),
         };
         let mut ring_room = match self.tool_filter {
-            ToolFilter::Ring => crate::ring::MAX_ITEMS.saturating_sub(self.config.tools.iter().filter(|t| t.ring).count()),
+            ToolFilter::Ring => crate::ring::MAX_ITEMS.saturating_sub(self.ring_count()),
             _ => 0,
         };
         for path in paths.paths() {

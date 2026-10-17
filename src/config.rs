@@ -148,6 +148,8 @@ pub struct Settings {
     pub ring_skip_fullscreen: bool,
     /// …or while one of these programs (exe file names) is in front.
     pub ring_excluded: Vec<String>,
+    /// Quick actions in the ring (their `action:…` keys), after the tools.
+    pub ring_actions: Vec<String>,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
     /// Pop the ring up around the mouse pointer instead of in the bottom-right corner.
@@ -309,6 +311,7 @@ impl Default for Settings {
             alt_ring: true,
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
+            ring_actions: Vec::new(),
             ring_bounce: 2,
             ring_at_cursor: false,
             wallpaper: Wallpaper::default(),

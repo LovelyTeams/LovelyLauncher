@@ -4,6 +4,11 @@
 use futures::channel::mpsc::UnboundedSender;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use gpui::Global;
+
+/// Where windows other than the launcher (the ring) send requests for it.
+pub struct AppEvents(pub UnboundedSender<AppEvent>);
+
+impl Global for AppEvents {}
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -20,6 +25,8 @@ pub enum AppEvent {
     Quit,
     /// Space / arrows / Esc in an Explorer file list (QuickLook-style preview).
     Preview(crate::preview::hook::HookEvent),
+    /// Run a quick action (picked in the ring, which has no access to the launcher's window).
+    Action(crate::launcher::QuickAction),
 }
 
 pub struct HotkeyService {

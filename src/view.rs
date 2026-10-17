@@ -890,7 +890,7 @@ impl Launcher {
             el.into_any_element()
         };
         tabs.push(tab(0, "全部".into(), total.to_string(), ToolFilter::All, None, cx));
-        let ring_count = all.iter().filter(|t| t.ring).count();
+        let ring_count = all.iter().filter(|t| t.ring).count() + self.ring_actions().len();
         tabs.push(tab(
             9999,
             "圆环".into(),
@@ -953,7 +953,35 @@ impl Launcher {
             _ => String::new(),
         };
         let add_category = prefill_category.clone();
-        let add_to_ring = self.tool_filter == ToolFilter::Ring && self.config.tools.iter().filter(|t| t.ring).count() < crate::ring::MAX_ITEMS;
+        let add_to_ring = self.tool_filter == ToolFilter::Ring && self.ring_count() < crate::ring::MAX_ITEMS;
+        // Quick actions in the ring sit after its tools.
+        if self.tool_filter == ToolFilter::Ring {
+            for (ix, action) in self.ring_actions().into_iter().enumerate() {
+                let visual = Visual::Glyph { icon: action.icon(), tint: "pink".into() };
+                let tile = self.tile(&visual, m.tile_icon, m.tile_icon / 2., theme, cx);
+                tiles.push(
+                    div()
+                        .id(("ring-action", ix))
+                        .h(px(m.tile_h))
+                        .rounded(px(14.))
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .px(px(6.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.panel).border_color(theme.border))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.quick_action(action, window, cx)))
+                        .on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(MenuTarget::Action(action), cx))
+                        .child(tile)
+                        .child(div().max_w_full().text_size(px(12.5)).truncate().child(action.label()))
+                        .into_any_element(),
+                );
+            }
+        }
         tiles.push(
             div()
                 .id("add-tool-card")
@@ -999,9 +1027,9 @@ impl Launcher {
                     .mr(px(8.))
                     .child(if self.tool_filter == ToolFilter::Ring {
                         if self.config.tools.iter().any(|t| t.ring) {
-                            "按住 Alt 弹出的圆环会显示这里的工具（最多 8 个）"
+                            "按住 Alt 弹出的圆环会显示这里的工具（最多 8 个）；快捷操作右键可加入"
                         } else {
-                            "把图标拖到“圆环”标签加入；没选时圆环显示最常用的 8 个"
+                            "把图标拖到“圆环”标签加入，快捷操作右键可加入；没选工具时显示最常用的"
                         }
                     } else {
                         "拖动图标或分类标签可调整顺序，图标拖到分类标签即可归类"
@@ -1183,12 +1211,17 @@ impl Launcher {
 
     fn render_actions_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let m = self.metrics;
-        let mut rows = Vec::new();
+        let in_ring = self.ring_actions();
+        let mut cells = Vec::new();
         for (ix, action) in QuickAction::ALL.into_iter().enumerate() {
-            rows.push(
+            let tip: SharedString = format!("{} · 右键可加入圆环", action.keys().join(" + ")).into();
+            let group: SharedString = format!("action-{ix}").into();
+            cells.push(
                 div()
                     .id(("action", ix))
+                    .group(group.clone())
                     .h(px(m.action_h))
+                    .min_w_0()
                     .px(px(10.))
                     .rounded(px(9.))
                     .border_1()
@@ -1196,20 +1229,20 @@ impl Launcher {
                     .bg(theme.input_bg)
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .cursor_pointer()
                     .hover(|s| s.border_color(theme.accent).bg(theme.accent_soft))
+                    .tooltip(move |_, cx| cx.new(|_| TextTooltip(tip.clone())).into())
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.quick_action(action, window, cx)
                     }))
-                    .child(icon(action.icon(), 16., theme.text_muted))
-                    .child(div().flex_1().text_size(px(13.5)).child(action.label()))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(3.))
-                            .children(action.keys().iter().map(|k| kbd(k, theme))),
-                    ),
+                    .on_mouse_down(MouseButton::Right, Self::open_menu_on_right_click(MenuTarget::Action(action), cx))
+                    .child({
+                        let accent = theme.accent;
+                        icon(action.icon(), 16., theme.text_muted).group_hover(group, move |s| s.text_color(accent))
+                    })
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(action.label()))
+                    .when(in_ring.contains(&action), |d| d.child(icon("circle", 12., theme.accent))),
             );
         }
         panel(theme)
@@ -1217,7 +1250,7 @@ impl Launcher {
             .flex()
             .flex_col()
             .child(self.panel_header("zap", "快捷操作", theme))
-            .child(div().flex().flex_col().gap(px(m.action_gap)).children(rows))
+            .child(div().grid().grid_cols(2).gap(px(m.action_gap)).children(cells))
     }
 
     // -----------------------------------------------------------------------
@@ -1919,6 +1952,13 @@ impl Launcher {
                 entries
             }
             MenuTarget::History(key) => vec![("trash", "从最近使用中移除".into(), MenuCommand::RemoveHistory(key.clone()), true)],
+            MenuTarget::Action(action) => {
+                let in_ring = self.ring_actions().contains(action);
+                vec![
+                    ("rocket", "运行".into(), MenuCommand::Open(Target::Action(*action)), false),
+                    ("circle", if in_ring { "移出圆环" } else { "加入圆环" }.into(), MenuCommand::ToggleRingAction(*action), false),
+                ]
+            }
         }
     }
 
@@ -2006,6 +2046,7 @@ impl Launcher {
             MenuCommand::Project(path, opener) => self.open_project_in(path, opener, cx),
             MenuCommand::RemoveProject(path) => self.remove_project(&path, cx),
             MenuCommand::RemoveHistory(key) => self.remove_history(&key, cx),
+            MenuCommand::ToggleRingAction(action) => self.toggle_ring_action(action, cx),
         }
         cx.notify();
     }
@@ -2079,6 +2120,24 @@ pub enum MenuCommand {
     Project(String, ProjectOpener),
     RemoveProject(String),
     RemoveHistory(String),
+    ToggleRingAction(QuickAction),
+}
+
+/// A hint shown when hovering, e.g. a quick action's shortcut.
+pub struct TextTooltip(pub SharedString);
+
+impl Render for TextTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        div()
+            .px(px(9.))
+            .py(px(5.))
+            .rounded(px(7.))
+            .bg(if theme.dark { rgb(0x3a323a) } else { rgb(0x2b2329) })
+            .text_color(gpui::white())
+            .text_size(px(12.))
+            .child(self.0.clone())
+    }
 }
 
 impl Render for Launcher {
@@ -2155,6 +2214,12 @@ impl Render for Launcher {
             }))
             .on_action(cx.listener(|this, _: &QuickNote, window, cx| {
                 this.quick_action(QuickAction::Note, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PickColor, window, cx| {
+                this.quick_action(QuickAction::ColorPicker, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MeasureScreen, window, cx| {
+                this.quick_action(QuickAction::Ruler, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 if this.dialog.is_none() {

@@ -14,6 +14,7 @@ mod input;
 mod highlight;
 mod launcher;
 mod markdown;
+mod overlay;
 mod preview;
 mod ring;
 mod scan;
@@ -75,6 +76,7 @@ fn main() {
             input::bind_keys(cx);
             launcher::bind_keys(cx);
             preview::bind_keys(cx);
+            overlay::bind_keys(cx);
             cx.set_global(preview::ffmpeg::FfmpegState {
                 path: preview::ffmpeg::find(&config.settings.ffmpeg_path),
                 ..Default::default()
@@ -82,6 +84,7 @@ fn main() {
             cx.set_global(Theme::from_settings(&config.settings, gpui::WindowAppearance::Light));
 
             let (tx, mut rx) = futures::channel::mpsc::unbounded::<AppEvent>();
+            cx.set_global(system::AppEvents(tx.clone()));
 
             let mut hotkeys = HotkeyService::new(tx.clone());
             let hotkey_error = hotkeys.apply(&config.settings.hotkey).err();

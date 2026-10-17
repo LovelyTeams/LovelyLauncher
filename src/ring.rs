@@ -332,7 +332,15 @@ impl Ring {
             return;
         };
         self.close(cx);
-        self.launcher.update(cx, |launcher, cx| launcher.launch_tool(&id, cx)).ok();
+        match crate::launcher::QuickAction::from_key(&id) {
+            // Actions need the launcher's own window: hand them over.
+            Some(action) => {
+                let _ = cx.global::<crate::system::AppEvents>().0.unbounded_send(crate::system::AppEvent::Action(action));
+            }
+            None => {
+                self.launcher.update(cx, |launcher, cx| launcher.launch_tool(&id, cx)).ok();
+            }
+        }
     }
 
     fn tile(&self, visual: &Visual, size: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {

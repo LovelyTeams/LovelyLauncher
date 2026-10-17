@@ -437,6 +437,58 @@ fn class_name(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
 }
 
+/// The pointer's position on the screen, in physical pixels.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor).ok()? };
+    Some((cursor.x, cursor.y))
+}
+
+pub fn set_cursor_position(x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+    unsafe {
+        let _ = SetCursorPos(x, y);
+    }
+}
+
+/// The whole monitor under the pointer: (left, top, right, bottom) in physical pixels.
+pub fn monitor_rect_at_cursor() -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let mut cursor = POINT::default();
+        GetCursorPos(&mut cursor).ok()?;
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let r = info.rcMonitor;
+        Some((r.left, r.top, r.right, r.bottom))
+    }
+}
+
+/// Cover `rect` (physical pixels) with the window, above everything, and give it the keyboard.
+pub fn cover_rect(raw: isize, rect: (i32, i32, i32, i32)) {
+    use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
+    remove_window_frame(raw);
+    let h = hwnd(raw);
+    let (l, t, r, b) = rect;
+    unsafe {
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), l, t, r - l, b - t, SWP_SHOWWINDOW);
+        // GPUI keeps an invisible frame around the client area: grow the window so
+        // that the client area, where the picture is drawn, is exactly `rect`.
+        let mut origin = POINT::default();
+        let mut client = RECT::default();
+        if windows::Win32::Graphics::Gdi::ClientToScreen(h, &mut origin).as_bool() && GetClientRect(h, &mut client).is_ok() {
+            let (ox, oy) = (origin.x - l, origin.y - t);
+            let (dw, dh) = ((r - l) - client.right, (b - t) - client.bottom);
+            if ox != 0 || oy != 0 || dw != 0 || dh != 0 {
+                let _ = SetWindowPos(h, Some(HWND_TOPMOST), l - ox, t - oy, r - l + dw, b - t + dh, SWP_SHOWWINDOW);
+            }
+        }
+        let _ = SetForegroundWindow(h);
+    }
+}
+
 /// The pointer's position relative to a window's top-left corner, in logical pixels.
 pub fn cursor_in_window(raw: isize) -> Option<(f32, f32)> {
     let h = hwnd(raw);
