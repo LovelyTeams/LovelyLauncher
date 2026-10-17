@@ -2479,7 +2479,18 @@ impl Launcher {
                         }))
                         .into_any_element()
                 });
+                let size = settings.ring_size.min(3) as usize;
+                let sizes = ["小", "标准", "大", "特大"].into_iter().enumerate().map(|(ix, label)| {
+                    segment(("ring-size", ix), label, ix == size, theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.config.settings.ring_size = ix as u8;
+                            this.config.save();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                });
                 d.child(choice_row("圆环弹性", "弹出、晃动和黏液拉伸的幅度", options.collect(), theme))
+                .child(choice_row("圆环大小", "按住 Alt 弹出的圆环有多大", sizes.collect(), theme))
                 .child(
                     toggle(
                         "ring-at-cursor",

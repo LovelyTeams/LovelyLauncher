@@ -168,6 +168,8 @@ pub struct Settings {
     pub snippets_enabled: bool,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
+    /// How big the ring is: 0 small, 1 standard, 2 large, 3 extra large.
+    pub ring_size: u8,
     /// Pop the ring up around the mouse pointer instead of in the bottom-right corner.
     pub ring_at_cursor: bool,
     /// A picture or video behind the main window.
@@ -337,6 +339,7 @@ impl Default for Settings {
             clipboard_hotkey: "Alt+Shift+V".into(),
             snippets_enabled: true,
             ring_bounce: 2,
+            ring_size: 1,
             ring_at_cursor: false,
             wallpaper: Wallpaper::default(),
             ffmpeg_path: String::new(),

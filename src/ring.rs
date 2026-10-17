@@ -144,6 +144,8 @@ pub struct Ring {
     logo: Option<Arc<RenderImage>>,
     /// The text ring: the selected text, quoted in the middle.
     text: Option<SharedString>,
+    /// Size factor (圆环大小): the layout is in units of the standard size, times this.
+    k: f32,
 }
 
 /// `a` blended towards `b` by `t`, as an opaque colour.
@@ -186,6 +188,7 @@ impl Ring {
             bounce: Bounce::level(2),
             logo: None,
             text: None,
+            k: 1.,
         }
     }
 
@@ -197,10 +200,12 @@ impl Ring {
         items: Vec<RingItem>,
         logo: Arc<RenderImage>,
         bounce: u8,
+        size: u8,
         at_cursor: bool,
         text: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.k = size_factor(size);
         let at_cursor = at_cursor || text.is_some();
         self.text = text.map(|t| excerpt(&t, 46).into());
         let b = Bounce::level(bounce);
@@ -223,7 +228,8 @@ impl Ring {
         self.pull_y = Spring::new(0., 300., 18.);
         if let Some(raw) = self.hwnd {
             // Not synchronously: moving the window re-enters GPUI.
-            cx.spawn(async move |_, _| win::place_corner_popup(raw, SIZE, MARGIN, at_cursor)).detach();
+            let side = SIZE * self.k;
+            cx.spawn(async move |_, _| win::place_corner_popup(raw, side, MARGIN, at_cursor)).detach();
         }
         cx.notify();
     }
@@ -261,6 +267,8 @@ impl Ring {
             return;
         }
         let Some((x, y)) = self.hwnd.and_then(win::cursor_in_window) else { return };
+        // In units of the standard size.
+        let (x, y) = (x / self.k, y / self.k);
         self.stick_to(x, y);
         let (dx, dy) = (x - CENTER, y - CENTER);
         let dist = (dx * dx + dy * dy).sqrt();
@@ -363,6 +371,16 @@ impl Ring {
     }
 }
 
+/// 圆环大小 setting → size factor.
+pub fn size_factor(size: u8) -> f32 {
+    match size {
+        0 => 0.8,
+        2 => 1.2,
+        3 => 1.4,
+        _ => 1.,
+    }
+}
+
 /// Colour of the text ring.
 const TEXT_ACCENT: gpui::Hsla = gpui::Hsla { h: 250. / 360., s: 0.62, l: 0.62, a: 1. };
 
@@ -421,13 +439,16 @@ impl Render for Ring {
                     this.launch(cx);
                 }),
             );
-        let s = self.scale.x.max(0.);
-        if self.phase == Phase::Hidden || s < 0.02 {
+        // `grow` is the animated pop; the layout is drawn `k` times the standard size.
+        let grow = self.scale.x.max(0.);
+        if self.phase == Phase::Hidden || grow < 0.02 {
             return root;
         }
+        let k = self.k;
+        let s = grow * k;
         let theme = Theme::get(cx).clone();
         let (sx, sy) = (s * (1. + self.squash.x), s * (1. - self.squash.x));
-        let c = CENTER;
+        let c = CENTER * k;
         // The text ring is blue-violet, so it is not mistaken for the tool ring.
         let accent = if self.text.is_some() { TEXT_ACCENT } else { theme.accent };
         let mut layers: Vec<AnyElement> = Vec::new();
@@ -505,31 +526,31 @@ impl Render for Ring {
         let (picture, title, note): (Option<AnyElement>, SharedString, SharedString) = match selected {
             Some((visual, name)) => {
                 let size = 62. * s * pop;
-                let tile = self.tile(&visual, size, &theme, cx).map(|t| place(t, c, c - 20., size));
+                let tile = self.tile(&visual, size, &theme, cx).map(|t| place(t, c, c - 20. * k, size));
                 (tile, name, if self.text.is_some() { "松开 Alt 执行" } else { "松开 Alt 打开" }.into())
             }
             None if self.text.is_some() => {
                 // The selected text, quoted.
                 let quote = self.text.clone().unwrap_or_default();
-                let fade = ((s - 0.8) / 0.2).clamp(0., 1.);
+                let fade = ((grow - 0.8) / 0.2).clamp(0., 1.);
                 let block = div()
                     .absolute()
-                    .left(px(c - 62.))
-                    .top(px(c - 44.))
-                    .w(px(124.))
-                    .h(px(70.))
+                    .left(px(c - 62. * k))
+                    .top(px(c - 44. * k))
+                    .w(px(124. * k))
+                    .h(px(70. * k))
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
                     .gap(px(2.))
                     .opacity(fade)
-                    .child(div().text_size(px(20.)).line_height(px(16.)).text_color(accent).child("“"))
+                    .child(div().text_size(px(20. * k)).line_height(px(16. * k)).text_color(accent).child("“"))
                     .child(
                         div()
                             .w_full()
-                            .text_size(px(12.))
-                            .line_height(px(16.))
+                            .text_size(px(12. * k))
+                            .line_height(px(16. * k))
                             .text_color(theme.text)
                             .text_center()
                             .line_clamp(3)
@@ -540,7 +561,7 @@ impl Render for Ring {
             }
             None => {
                 let size = 76. * s * pop;
-                let logo = self.logo.clone().map(|logo| place(img(logo).size(px(size)).into_any_element(), c, c - 14., size));
+                let logo = self.logo.clone().map(|logo| place(img(logo).size(px(size)).into_any_element(), c, c - 14. * k, size));
                 let (title, note) = if self.items.is_empty() {
                     ("还没有工具", "先在主界面添加工具")
                 } else {
@@ -550,25 +571,29 @@ impl Render for Ring {
             }
         };
         layers.extend(picture);
-        let fade = ((s - 0.8) / 0.2).clamp(0., 1.);
+        let fade = ((grow - 0.8) / 0.2).clamp(0., 1.);
         if fade > 0. {
             let hint = hsla(accent.h, accent.s * 0.7, if theme.dark { 0.72 } else { 0.42 }, 1.);
-            let line = |top: f32, height: f32| div().absolute().left(px(c - 72.)).top(px(top)).w(px(144.)).h(px(height)).flex().justify_center().opacity(fade);
-            let (title_y, note_y) = if title.is_empty() { (0., c + 36.) } else { (c + 18., c + 40.) };
+            // Text keeps a fixed size while animating (scaling it made it shimmer); it
+            // only follows the chosen ring size.
+            let line = |top: f32, height: f32| {
+                div().absolute().left(px(c - 72. * k)).top(px(top)).w(px(144. * k)).h(px(height * k)).flex().justify_center().opacity(fade)
+            };
+            let (title_y, note_y) = if title.is_empty() { (0., c + 36. * k) } else { (c + 18. * k, c + 40. * k) };
             if !title.is_empty() {
                 layers.push(
                     line(title_y, 20.)
-                        .child(div().max_w_full().truncate().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text).child(title))
+                        .child(div().max_w_full().truncate().text_size(px(14. * k)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text).child(title))
                         .into_any_element(),
                 );
             }
-            layers.push(line(note_y, 16.).child(div().text_size(px(10.5)).text_color(hint).child(note)).into_any_element());
+            layers.push(line(note_y, 16.).child(div().text_size(px((10.5 * k).max(9.5))).text_color(hint).child(note)).into_any_element());
         }
 
         // Icons around the band.
         for i in 0..self.items.len() {
-            let grow = self.icons[i].x.max(0.);
-            let size = TILE * s * grow;
+            let pop_in = self.icons[i].x.max(0.);
+            let size = TILE * s * pop_in;
             if size < 2. {
                 continue;
             }
