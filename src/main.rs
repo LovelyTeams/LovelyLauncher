@@ -4,6 +4,7 @@
 mod ai;
 mod ai_history;
 mod clipboard;
+mod calc;
 mod config;
 mod dialogs;
 mod download;
@@ -101,6 +102,7 @@ fn main() {
             cx.set_global(TrayHolder(system::create_tray(tx.clone())));
             preview::hook::ENABLED.store(config.settings.space_preview, std::sync::atomic::Ordering::Relaxed);
             preview::hook::RING_ENABLED.store(config.settings.alt_ring, std::sync::atomic::Ordering::Relaxed);
+            preview::hook::set_ring_key(&config.settings.ring_key);
             preview::hook::start(tx.clone(), AppEvent::Preview);
             win::listen_for_show_requests({
                 let tx = tx.clone();

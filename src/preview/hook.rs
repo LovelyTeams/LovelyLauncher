@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
@@ -23,8 +23,8 @@ use windows::{
         },
         UI::{
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LMENU, VK_LWIN, VK_MENU,
-                VK_RIGHT, VK_RMENU, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
+                GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL, VK_LEFT, VK_LMENU,
+                VK_LWIN, VK_MENU, VK_RCONTROL, VK_RIGHT, VK_RMENU, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
             },
             Shell::{
                 CSIDL_DESKTOP, IFolderView, IShellBrowser, IShellItemArray, IShellWindows,
@@ -64,6 +64,28 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static PREVIEW_OPEN: AtomicBool = AtomicBool::new(false);
 /// Whether holding Alt shows the app ring (Settings → 通用).
 pub static RING_ENABLED: AtomicBool = AtomicBool::new(true);
+static RING_KEY: AtomicU8 = AtomicU8::new(0);
+pub const RING_KEYS: [(&str, &str); 5] = [("alt", "Alt"), ("lalt", "左 Alt"), ("ralt", "右 Alt"), ("ctrl", "Ctrl"), ("rctrl", "右 Ctrl")];
+
+pub fn ring_key_index(name: &str) -> usize {
+    RING_KEYS.iter().position(|(key, _)| key.eq_ignore_ascii_case(name)).unwrap_or(0)
+}
+
+pub fn set_ring_key(name: &str) {
+    RING_KEY.store(ring_key_index(name) as u8, Ordering::Relaxed);
+    ALT_DOWN.store(false, Ordering::Relaxed);
+    ALT_ALONE.store(false, Ordering::Relaxed);
+}
+
+fn ring_trigger(index: u8) -> (&'static [VIRTUAL_KEY], VIRTUAL_KEY) {
+    match index {
+        1 => (&[VK_LMENU], VK_MENU),
+        2 => (&[VK_RMENU], VK_MENU),
+        3 => (&[VK_CONTROL, VK_LCONTROL, VK_RCONTROL], VK_CONTROL),
+        4 => (&[VK_RCONTROL], VK_CONTROL),
+        _ => (&[VK_MENU, VK_LMENU, VK_RMENU], VK_MENU),
+    }
+}
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 /// Alt is down and nothing else has been pressed since.
 static ALT_ALONE: AtomicBool = AtomicBool::new(false);
@@ -103,10 +125,14 @@ fn key_down(vk: i32) -> bool {
 fn track_alt(vk: u16, msg: u32, injected: bool) {
     let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-    if vk == VK_MENU.0 || vk == VK_LMENU.0 || vk == VK_RMENU.0 {
+    let (keys, family) = ring_trigger(RING_KEY.load(Ordering::Relaxed));
+    if keys.iter().any(|k| k.0 == vk) {
         if down && !ALT_DOWN.swap(true, Ordering::Relaxed) {
             // Ctrl+Alt (AltGr), Shift+Alt and Win+Alt are shortcuts.
-            let others = [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN].iter().any(|m| key_down(m.0 as i32));
+            let others = [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                .iter()
+                .filter(|m| **m != family)
+                .any(|m| key_down(m.0 as i32));
             ALT_ALONE.store(!others, Ordering::Relaxed);
             if !others {
                 send(HookEvent::AltDown);

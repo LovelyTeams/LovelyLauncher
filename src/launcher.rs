@@ -47,6 +47,7 @@ actions!(
         AddTool,
         FocusNextField,
         FocusPrevField,
+        CompleteSearch,
     ]
 );
 
@@ -71,6 +72,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-m", OpenMemos, launcher),
         KeyBinding::new("ctrl-,", OpenSettings, launcher),
         KeyBinding::new("ctrl-d", AddTool, launcher),
+        KeyBinding::new("tab", CompleteSearch, launcher),
         KeyBinding::new("tab", FocusNextField, dialog),
         KeyBinding::new("shift-tab", FocusPrevField, dialog),
         KeyBinding::new("enter", Confirm, dialog),
@@ -266,6 +268,11 @@ fn memo_query(query: &str) -> Option<&str> {
     None
 }
 
+fn palette_query(query: &str) -> Option<&str> {
+    let query = query.trim_start();
+    ['/', '、', '／'].into_iter().find_map(|c| query.strip_prefix(c)).map(str::trim)
+}
+
 /// `cb` or `cb …` in the search box: what to filter 剪贴板历史 by.
 fn clipboard_filter(query: &str) -> Option<&str> {
     let query = query.trim_start();
@@ -346,6 +353,16 @@ mod ring_tests {
         assert_eq!(ids(pick_ring_tools(&tools, &history, 3)), ["d", "c", "b"]);
         assert_eq!(ids(pick_ring_tools(&tools, &history, 8)), ["d", "c", "b", "a"]);
     }
+
+    #[test]
+    fn palette_prefixes() {
+        assert_eq!(palette_query("/"), Some(""));
+        assert_eq!(palette_query(" /截图 "), Some("截图"));
+        assert_eq!(palette_query("、jt"), Some("jt"));
+        assert_eq!(palette_query("／bw"), Some("bw"));
+        assert_eq!(palette_query("a/b"), None);
+        assert!(external_reserved("/anything"));
+    }
 }
 
 /// Arguments from a split command line followed by the tool's own.
@@ -385,6 +402,10 @@ pub enum Target {
     Memo(String),
     External { source: String, id: String, action: crate::external_search::Activation },
     LoadMore(String),
+    CopyText(String),
+    Fill(String),
+    OpenSettings,
+    AddTool,
 }
 
 impl Target {
@@ -648,7 +669,7 @@ impl Launcher {
     ) -> Self {
         config.settings.autostart = win::is_autostart();
 
-        let search = cx.new(|cx| TextInput::new("搜索工具、应用、项目，或输入命令…", cx));
+        let search = cx.new(|cx| TextInput::new("搜索工具、应用、项目，输入 / 查看全部命令…", cx));
         let hwnd = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
             _ => None,
@@ -1236,6 +1257,10 @@ impl Launcher {
         if q.is_empty() {
             return;
         }
+        if let Some(filter) = palette_query(raw) {
+            self.results = self.palette_results(&filter.to_lowercase());
+            return;
+        }
 
         // `bw …` / `tx …` / `提醒我…`: 备忘录, or a new one.
         if self.config.settings.memo_enabled
@@ -1267,6 +1292,16 @@ impl Launcher {
                     score: 10_000,
                 });
             }
+        }
+        for (ix, answer) in crate::calc::evaluate(raw).into_iter().enumerate() {
+            items.push(ResultItem {
+                target: Target::CopyText(answer.value.clone()),
+                title: answer.value.into(),
+                subtitle: format!("{} · {raw} · Enter 复制", answer.label).into(),
+                badge: "计算器".into(),
+                visual: Visual::Glyph { icon: "calculator", tint: "green".into() },
+                score: 20_000 - ix as i32,
+            });
         }
         if looks_like_url(raw) {
             items.push(ResultItem {
@@ -1393,6 +1428,91 @@ impl Launcher {
             score: i32::MIN,
         });
         self.results = items;
+    }
+
+    fn search_modes(&self) -> Vec<(String, String, String, &'static str)> {
+        let settings = &self.config.settings;
+        let mut modes = vec![("cb ".to_string(), "搜索剪贴板历史".to_string(), "后面接要找的内容，文本片段也在里面".to_string(), "clipboard")];
+        if settings.memo_enabled {
+            modes.push(("bw ".into(), "添加备忘录".into(), "如 bw 明天9点 开会，写上时间会提醒".into(), "sticky-note"));
+        }
+        modes.push(("@ai ".into(), "问 AI".into(), "后面接问题，Enter 提问".into(), "sparkles"));
+        modes.push(("> ".into(), "运行命令".into(), "在新的命令行窗口中执行".into(), "terminal"));
+        modes.push(("= ".into(), "计算器 / 进制转换".into(), "也可直接输入算式：1+2*3、sqrt(2)、255 to hex、0xff".into(), "calculator"));
+        for source in settings.external_sources.iter().filter(|s| s.enabled) {
+            modes.push((format!("{} ", source.keyword), format!("搜索 {}", source.name), "只在这个搜索源里查".into(), "search"));
+        }
+        modes
+    }
+
+    fn palette_results(&self, filter: &str) -> Vec<ResultItem> {
+        let item = |target: Target, title: String, subtitle: String, badge: &'static str, icon: &'static str| ResultItem {
+            target,
+            title: title.into(),
+            subtitle: subtitle.into(),
+            badge: badge.into(),
+            visual: Visual::Glyph { icon, tint: if badge == "命令" { "purple".into() } else { "pink".into() } },
+            score: 0,
+        };
+        let mut items: Vec<ResultItem> = self
+            .quick_actions()
+            .into_iter()
+            .map(|a| item(Target::Action(a), a.label().into(), format!("快捷键 {}", a.keys().join("+")), "操作", a.icon()))
+            .collect();
+        items.push(item(Target::OpenSettings, "打开设置".into(), "快捷键 Ctrl+,".into(), "操作", "settings"));
+        items.push(item(Target::AddTool, "添加工具".into(), "快捷键 Ctrl+D".into(), "操作", "plus"));
+        items.extend(self.search_modes().into_iter().map(|(prefix, title, hint, icon)| {
+            let subtitle = format!("输入“{}” · {hint}", prefix.trim_end());
+            item(Target::Fill(prefix), title, subtitle, "命令", icon)
+        }));
+        if filter.is_empty() {
+            return items;
+        }
+        let mut items: Vec<ResultItem> = items
+            .into_iter()
+            .filter_map(|mut item| {
+                let prefix = match &item.target {
+                    Target::Fill(p) => p.trim_end().to_lowercase().starts_with(filter).then_some(950),
+                    _ => None,
+                };
+                item.score = SearchKey::new(&item.title).score(filter).max(prefix)?;
+                Some(item)
+            })
+            .collect();
+        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items
+    }
+
+    pub(crate) fn completion(&self) -> Option<String> {
+        match self.results.get(self.selected).map(|r| &r.target) {
+            Some(Target::Fill(prefix)) => return Some(prefix.clone()),
+            Some(Target::Action(action)) if palette_query(&self.search_text).is_some() => {
+                return Some(format!("/{}", action.label()));
+            }
+            _ => {}
+        }
+        let typed = self.search_text.trim_start().to_lowercase();
+        if typed.is_empty() || typed.contains(char::is_whitespace) {
+            return None;
+        }
+        let settings = &self.config.settings;
+        let mut prefixes = vec!["cb ".to_string()];
+        if settings.memo_enabled {
+            prefixes.extend(["bw ".to_string(), "memo ".to_string()]);
+        }
+        prefixes.push("@ai ".into());
+        prefixes.extend(settings.ai_providers.iter().map(|p| format!("@{} ", p.id.to_lowercase())));
+        prefixes.extend(settings.external_sources.iter().filter(|s| s.enabled).map(|s| format!("{} ", s.keyword.to_lowercase())));
+        prefixes.into_iter().find(|p| p.starts_with(&typed))
+    }
+
+    pub fn result_path(&self, target: &Target) -> Option<String> {
+        match target {
+            Target::File { path, .. } | Target::App(path) => Some(path.display().to_string()),
+            Target::Project(path) => Some(path.clone()),
+            Target::Tool(id) => self.config.tools.iter().find(|t| &t.id == id).map(|t| t.target.trim().to_string()).filter(|t| !t.is_empty() && t != "terminal"),
+            _ => None,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2866,6 +2986,7 @@ impl Launcher {
         if !self.config.settings.everything
             || self.ai_request().is_some()
             || clipboard_filter(&query).is_some()
+            || palette_query(&query).is_some()
             || (self.config.settings.memo_enabled && memo_query(&query).is_some())
             || query.chars().count() < 2
             || query.starts_with('>')
@@ -3166,6 +3287,25 @@ impl Launcher {
             }
             Target::Memo(id) => {
                 self.open_memos(Some(id.clone()), window, cx);
+                hide = false;
+            }
+            Target::CopyText(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                self.show_toast(format!("已复制 {text}"), false, cx);
+                hide = false;
+            }
+            Target::Fill(prefix) => {
+                let prefix = prefix.clone();
+                self.search.update(cx, |input, cx| input.set_text(prefix, cx));
+                window.focus(&self.search.focus_handle(cx));
+                hide = false;
+            }
+            Target::OpenSettings => {
+                self.open_settings(window, cx);
+                hide = false;
+            }
+            Target::AddTool => {
+                self.open_tool_editor(None, None, window, cx);
                 hide = false;
             }
         }
@@ -3902,6 +4042,24 @@ impl Launcher {
         window.focus(&self.search.focus_handle(cx));
     }
 
+    pub fn complete_search(&mut self, _: &CompleteSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(text) = self.completion() else { return };
+        self.search.update(cx, |input, cx| input.set_text(text, cx));
+        window.focus(&self.search.focus_handle(cx));
+    }
+
+    pub fn copy_selected_path(&mut self, _: &crate::input::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        if let Some(path) = self.results.get(self.selected).and_then(|r| self.result_path(&r.target)) {
+            self.copy_path(&path, cx);
+        }
+    }
+
     pub fn quick_action(&mut self, action: QuickAction, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog.is_some() {
             return;
@@ -3974,7 +4132,7 @@ fn normalize_url(s: &str) -> String {
 }
 
 pub(crate) fn external_reserved(s: &str) -> bool {
-    clipboard_filter(s).is_some() || memo_query(s).is_some() || looks_like_url(s)
+    clipboard_filter(s).is_some() || memo_query(s).is_some() || palette_query(s).is_some() || looks_like_url(s)
 }
 
 fn url_encode(s: &str) -> String {

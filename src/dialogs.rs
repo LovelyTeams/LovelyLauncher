@@ -2652,7 +2652,7 @@ impl Launcher {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text_faint)
-                            .child("这些程序在前台时，按住 Alt 不会弹出圆环（比如窗口模式运行的游戏）"),
+                            .child("这些程序在前台时，按住触发键不会弹出圆环（比如窗口模式运行的游戏）"),
                     ),
             )
             .child(div().flex().flex_wrap().gap(px(6.)).children(current))
@@ -2983,8 +2983,8 @@ impl Launcher {
             .child(
                 toggle(
                     "alt-ring",
-                    "按住 Alt 弹出圆环菜单",
-                    "单独按住 Alt 约 0.3 秒弹出工具圆环，工具在“全部工具 → 圆环”里挑选",
+                    "按住触发键弹出圆环菜单",
+                    "单独按住触发键（默认 Alt）约 0.3 秒弹出工具圆环，工具在“全部工具 → 圆环”里挑选",
                     settings.alt_ring,
                     theme,
                 )
@@ -3017,8 +3017,20 @@ impl Launcher {
                         }))
                         .into_any_element()
                 });
-                d.child(choice_row("圆环弹性", "弹出、晃动和黏液拉伸的幅度", options.collect(), theme))
-                .child(choice_row("圆环大小", "按住 Alt 弹出的圆环有多大", sizes.collect(), theme))
+                let ring_key = crate::preview::hook::ring_key_index(&settings.ring_key);
+                let keys = crate::preview::hook::RING_KEYS.into_iter().enumerate().map(|(ix, (key, label))| {
+                    segment(("ring-key", ix), label, ix == ring_key, theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.config.settings.ring_key = key.into();
+                            this.config.save();
+                            crate::preview::hook::set_ring_key(key);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                });
+                d.child(choice_row("圆环触发键", "单独按住这个键弹出圆环，和其他键一起按仍是普通快捷键", keys.collect(), theme))
+                .child(choice_row("圆环弹性", "弹出、晃动和黏液拉伸的幅度", options.collect(), theme))
+                .child(choice_row("圆环大小", "按住触发键弹出的圆环有多大", sizes.collect(), theme))
                 .child(
                     toggle(
                         "ring-at-cursor",
@@ -3051,7 +3063,7 @@ impl Launcher {
                     toggle(
                         "text-ring",
                         "选中文字时弹出划词圆环",
-                        "先选中一段文字再按住 Alt：在鼠标旁弹出另一种颜色的圆环，可以翻译、解释、总结、搜索、复制",
+                        "先选中一段文字再按住触发键：在鼠标旁弹出另一种颜色的圆环，可以翻译、解释、总结、搜索、复制",
                         settings.text_ring,
                         theme,
                     )
@@ -3065,8 +3077,8 @@ impl Launcher {
                     d.child(
                         toggle(
                             "text-ring-copy",
-                            "复制文字后按住 Alt 也弹出划词圆环",
-                            "读不到选中文字的程序里（比如微信、QQ），先 Ctrl+C 再在 4 秒内按住 Alt",
+                            "复制文字后按住触发键也弹出划词圆环",
+                            "读不到选中文字的程序里（比如微信、QQ），先 Ctrl+C 再在 4 秒内按住触发键",
                             settings.text_ring_after_copy,
                             theme,
                         )

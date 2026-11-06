@@ -1027,7 +1027,7 @@ impl Launcher {
                     .mr(px(8.))
                     .child(if self.tool_filter == ToolFilter::Ring {
                         if self.config.tools.iter().any(|t| t.ring) {
-                            "按住 Alt 弹出的圆环会显示这里的工具（最多 8 个）；快捷操作右键可加入"
+                            "按住触发键弹出的圆环会显示这里的工具（最多 8 个）；快捷操作右键可加入"
                         } else {
                             "把图标拖到“圆环”标签加入，快捷操作右键可加入；没选工具时显示最常用的"
                         }
@@ -1275,6 +1275,7 @@ impl Launcher {
                 Target::Snippet(id) => Some(MenuTarget::Snippet(id.clone())),
                 _ => None,
             };
+            let copy_path = selected.then(|| self.result_path(&item.target)).flatten();
             rows.push(
                 div()
                     .id(("result", ix))
@@ -1316,6 +1317,23 @@ impl Launcher {
                                     .child(item.subtitle.clone()),
                             ),
                     )
+                    .when_some(copy_path, |d, path| {
+                        d.child(
+                            div()
+                                .id(("copy-path", ix))
+                                .flex_none()
+                                .p(px(5.))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.panel))
+                                .tooltip(|_, cx| cx.new(|_| TextTooltip("复制路径 (Ctrl+C)".into())).into())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.copy_path(&path, cx);
+                                }))
+                                .child(icon("copy", 14., theme.text_muted)),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -1331,6 +1349,8 @@ impl Launcher {
             );
         }
 
+        let completion = self.completion().is_some();
+        let copyable = results.get(self.selected).is_some_and(|r| self.result_path(&r.target).is_some());
         let hint = |keys: &'static str, label: &'static str| {
             div()
                 .flex()
@@ -1381,6 +1401,8 @@ impl Launcher {
                         .child(hint("↑↓", "选择"))
                         .child(hint("Enter", "打开"))
                         .when(!mini, |d| d.child(hint("Ctrl+Enter", "以管理员身份运行")))
+                        .when(completion, |d| d.child(hint("Tab", "补全")))
+                        .when(copyable, |d| d.child(hint("Ctrl+C", "复制路径")))
                         .child(hint("Esc", "清空"))
                         .child(div().flex_1())
                         .child(format!("{} 个结果", results.iter().filter(|r| !matches!(r.target, Target::LoadMore(_))).count())),
@@ -2240,6 +2262,8 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::focus_next_field))
             .on_action(cx.listener(Self::focus_prev_field))
+            .on_action(cx.listener(Self::complete_search))
+            .on_action(cx.listener(Self::copy_selected_path))
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                 this.quick_action(QuickAction::NewTerminal, window, cx)
             }))

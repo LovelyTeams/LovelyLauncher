@@ -145,6 +145,7 @@ pub struct Settings {
     pub preview_size: Option<[f32; 2]>,
     /// Hold Alt to pop up a ring of favourite tools in the bottom-right corner.
     pub alt_ring: bool,
+    pub ring_key: String,
     /// …except while a full-screen program (a game, a video) is in front.
     pub ring_skip_fullscreen: bool,
     /// …or while one of these programs (exe file names) is in front.
@@ -337,6 +338,7 @@ impl Default for Settings {
             preview_wrap: true,
             preview_size: None,
             alt_ring: true,
+            ring_key: "alt".into(),
             ring_skip_fullscreen: true,
             ring_excluded: Vec::new(),
             ring_actions: Vec::new(),
