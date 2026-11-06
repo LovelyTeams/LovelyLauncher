@@ -6,11 +6,12 @@ use std::ffi::c_void;
 
 use windows::{
     Win32::Networking::WinHttp::{
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
         WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
         WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
         WinHttpQueryHeaders,
         WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+        WinHttpSetOption, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
     },
     core::{HSTRING, PCWSTR},
 };
@@ -90,21 +91,27 @@ pub struct ResponseHead {
 pub fn send(
     req: &Request,
     on_head: impl FnOnce(&ResponseHead),
-    mut on_data: impl FnMut(&[u8]) -> bool,
+    on_data: impl FnMut(&[u8]) -> bool,
 ) -> Result<u32, String> {
+    send_inner(req, on_head, on_data, false)
+}
+
+fn send_inner(req: &Request, on_head: impl FnOnce(&ResponseHead), mut on_data: impl FnMut(&[u8]) -> bool, search: bool) -> Result<u32, String> {
     let url = parse_url(req.url)?;
+    let local_search = search && ["127.0.0.1", "localhost"].contains(&url.host.as_str());
     unsafe {
         let session = handle(
             WinHttpOpen(
                 &HSTRING::from(concat!("LovelyLauncher/", env!("CARGO_PKG_VERSION"))),
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                if local_search { WINHTTP_ACCESS_TYPE_NO_PROXY } else { WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY },
                 PCWSTR::null(),
                 PCWSTR::null(),
                 0,
             ),
             "初始化网络",
         )?;
-        let _ = WinHttpSetTimeouts(session.0, 0, 30_000, 60_000, req.receive_timeout_ms);
+        let timeout = req.receive_timeout_ms.clamp(200, 10000);
+        let _ = WinHttpSetTimeouts(session.0, if search { timeout } else { 0 }, if local_search { timeout.min(500) } else if search { timeout } else { 30_000 }, if search { timeout } else { 60_000 }, req.receive_timeout_ms);
         let connect = handle(
             WinHttpConnect(session.0, &HSTRING::from(url.host.as_str()), url.port, 0),
             "连接服务器",
@@ -127,6 +134,12 @@ pub fn send(
             "创建请求",
         )?;
 
+        if search {
+            let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(Some(request.0.cast_const()), WINHTTP_OPTION_REDIRECT_POLICY,
+                Some(&policy.to_ne_bytes()))
+                .map_err(|_| "无法设置搜索请求选项")?;
+        }
         let headers: String = req
             .headers
             .iter()
@@ -172,6 +185,22 @@ pub fn send(
         }
         Ok(status)
     }
+}
+
+pub fn fetch_search(req: &Request, limit: usize) -> Result<(u32, Vec<u8>), String> {
+    let mut bytes = Vec::new();
+    let mut incomplete = false;
+    let start = std::time::Instant::now();
+    let status = send_inner(req, |_| {}, |chunk| {
+        if bytes.len().saturating_add(chunk.len()) > limit || start.elapsed().as_millis() >= req.receive_timeout_ms as u128 {
+            incomplete = true;
+            return false;
+        }
+        bytes.extend_from_slice(chunk);
+        true
+    }, true)?;
+    if incomplete { return Err("搜索响应过大或超时".into()); }
+    Ok((status, bytes))
 }
 
 /// Convenience: send and collect the whole body (capped at `limit` bytes).

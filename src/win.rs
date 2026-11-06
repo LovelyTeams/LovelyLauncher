@@ -72,6 +72,10 @@ pub fn show_window(raw: isize) {
     }
 }
 
+pub fn allow_foreground(pid: u32) {
+    if pid != 0 { unsafe { let _ = AllowSetForegroundWindow(pid); } }
+}
+
 pub fn hide_window(raw: isize) {
     unsafe {
         let _ = ShowWindow(hwnd(raw), SW_HIDE);
@@ -1268,6 +1272,23 @@ pub enum Instance {
     Primary,
     /// Another instance is running and has been asked to show itself.
     Secondary,
+}
+
+pub struct ConfigurationLock(HANDLE);
+impl Drop for ConfigurationLock {
+    fn drop(&mut self) { unsafe { let _ = windows::Win32::System::Threading::ReleaseMutex(self.0); let _ = CloseHandle(self.0); } }
+}
+
+/// Offline configuration imports must never overwrite a running instance's settings.
+pub fn lock_configuration() -> Result<ConfigurationLock, String> {
+    unsafe {
+        let handle = CreateMutexW(None, true, &HSTRING::from(MUTEX_NAME)).map_err(|_| "无法锁定配置")?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            return Err("LovelyLauncher 正在运行，请先从托盘退出后再通过命令行导入；运行中可使用设置内的导入入口".into());
+        }
+        Ok(ConfigurationLock(handle))
+    }
 }
 
 pub fn acquire_single_instance() -> Instance {

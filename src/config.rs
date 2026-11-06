@@ -127,6 +127,7 @@ pub struct Settings {
     pub everything: bool,
     /// Web search URL template; `{q}` is replaced with the encoded query.
     pub search_engine: String,
+    pub external_sources: Vec<crate::external_search::Source>,
     /// AI providers for `@ai` quick questions.
     pub ai_providers: Vec<AiProvider>,
     /// Id of the provider `@ai` uses.
@@ -326,6 +327,7 @@ impl Default for Settings {
             mini_on_hotkey: true,
             everything: true,
             search_engine: SEARCH_ENGINES[0].1.into(),
+            external_sources: Vec::new(),
             ai_providers: default_ai_providers(),
             ai_active: "deepseek".into(),
             ai_keep_history: true,

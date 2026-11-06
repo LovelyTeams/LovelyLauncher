@@ -8,6 +8,7 @@ mod config;
 mod dialogs;
 mod download;
 mod everything;
+mod external_search;
 mod http;
 mod icon_image;
 mod icons;
@@ -22,6 +23,7 @@ mod reminder;
 mod ring;
 mod scan;
 mod search;
+mod search_config;
 mod select;
 mod system;
 mod start_menu;
@@ -46,6 +48,7 @@ use crate::{
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = search_config::run(&args) { std::process::exit(code); }
     // Helper process that renders PDF pages for the preview (see preview::pdf).
     if let Some(i) = args.iter().position(|a| a == preview::pdf::WORKER_FLAG) {
         if let Some(path) = args.get(i + 1) {

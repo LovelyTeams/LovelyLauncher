@@ -284,7 +284,7 @@ fn snippet_item(snippet: &crate::config::Snippet, score: i32) -> ResultItem {
         target: Target::Snippet(snippet.id.clone()),
         title: snippet.name.clone().into(),
         subtitle: format!("文本片段 · {preview}").into(),
-        badge: "片段",
+        badge: "片段".into(),
         visual: Visual::Glyph { icon: "type", tint: "purple".into() },
         score,
     }
@@ -383,6 +383,8 @@ pub enum Target {
     NewMemo(String),
     /// A 备忘录 (by id): opened in 备忘录.
     Memo(String),
+    External { source: String, id: String, action: crate::external_search::Activation },
+    LoadMore(String),
 }
 
 impl Target {
@@ -428,7 +430,7 @@ pub struct ResultItem {
     pub target: Target,
     pub title: SharedString,
     pub subtitle: SharedString,
-    pub badge: &'static str,
+    pub badge: SharedString,
     pub visual: Visual,
     score: i32,
 }
@@ -616,6 +618,7 @@ pub struct Launcher {
     /// Full-window geometry to restore when leaving mini mode.
     full_rect: Option<win::WindowRect>,
     everything_generation: u64,
+    pub(crate) external: crate::external_search::Runtime,
     pub(crate) tools_scroll: ScrollHandle,
     /// Scrolls the favourites when they are shown as tiles.
     pub(crate) fav_scroll: gpui::ScrollHandle,
@@ -738,6 +741,7 @@ impl Launcher {
             mini: false,
             full_rect: None,
             everything_generation: 0,
+            external: Default::default(),
             tools_scroll: ScrollHandle::new(),
             fav_scroll: gpui::ScrollHandle::new(),
             wallpaper_image: None,
@@ -1026,6 +1030,8 @@ impl Launcher {
             let search = self.search.clone();
             search.update(cx, |input, cx| input.select_all_text(cx));
             window.focus(&search.focus_handle(cx));
+            self.schedule_external(cx);
+            self.sync_mini_size(cx);
         }
         cx.notify();
     }
@@ -1224,6 +1230,9 @@ impl Launcher {
         self.results.clear();
         self.selected = 0;
         self.results_scroll.set_offset(Default::default());
+        if crate::external_search::route(raw, &self.config.settings.external_sources).1.is_some() {
+            return;
+        }
         if q.is_empty() {
             return;
         }
@@ -1250,7 +1259,7 @@ impl Launcher {
                     target: Target::Command(cmd.to_string()),
                     title: format!("运行命令：{cmd}").into(),
                     subtitle: "在新的命令行窗口中执行".into(),
-                    badge: "命令",
+                    badge: "命令".into(),
                     visual: Visual::Glyph {
                         icon: "terminal",
                         tint: "slate".into(),
@@ -1264,7 +1273,7 @@ impl Launcher {
                 target: Target::Url(normalize_url(raw)),
                 title: format!("打开网址 {raw}").into(),
                 subtitle: normalize_url(raw).into(),
-                badge: "网页",
+                badge: "网页".into(),
                 visual: Visual::Glyph {
                     icon: "link",
                     tint: "sky".into(),
@@ -1301,7 +1310,7 @@ impl Launcher {
                     } else {
                         tool.description.clone().into()
                     },
-                    badge: "工具",
+                    badge: "工具".into(),
                     visual: Self::tool_visual(tool),
                     score: score + 60 + usage_bonus(&self.config, &format!("tool:{}", tool.id)),
                 });
@@ -1320,7 +1329,7 @@ impl Launcher {
                     target: Target::App(entry.app.path.clone()),
                     title: entry.app.name.clone().into(),
                     subtitle: "应用程序".into(),
-                    badge: "应用",
+                    badge: "应用".into(),
                     visual: Visual::File {
                         target: entry.app.path.display().to_string(),
                         tint: "slate".into(),
@@ -1340,7 +1349,7 @@ impl Launcher {
                     target: Target::Project(project.path.clone()),
                     title: project.name.clone().into(),
                     subtitle: project.path.clone().into(),
-                    badge: "项目",
+                    badge: "项目".into(),
                     visual: Visual::Folder,
                     score: score + 20,
                 });
@@ -1360,7 +1369,7 @@ impl Launcher {
                     target: Target::Action(action),
                     title: action.label().into(),
                     subtitle: format!("快捷操作 · {}", action.keys().join("+")).into(),
-                    badge: "操作",
+                    badge: "操作".into(),
                     visual: Visual::Glyph {
                         icon: action.icon(),
                         tint: "pink".into(),
@@ -1376,7 +1385,7 @@ impl Launcher {
             target: Target::WebSearch(raw.to_string()),
             title: format!("在网络上搜索“{raw}”").into(),
             subtitle: format!("使用{}", self.config.settings.search_engine_name()).into(),
-            badge: "搜索",
+            badge: "搜索".into(),
             visual: Visual::Glyph {
                 icon: "search",
                 tint: "blue".into(),
@@ -1536,7 +1545,7 @@ impl Launcher {
                 target: Target::NewMemo(input.to_string()),
                 title: title.into(),
                 subtitle: subtitle.into(),
-                badge: "新建",
+                badge: "新建".into(),
                 visual: Visual::Glyph { icon: if when.is_some() { "bell" } else { "sticky-note" }, tint: "orange".into() },
                 score: 0,
             });
@@ -1545,7 +1554,7 @@ impl Launcher {
                 target: Target::Action(QuickAction::Memo),
                 title: "打开备忘录".into(),
                 subtitle: "Ctrl+M · 在 bw 后面写内容可以直接添加，写上时间就会提醒".into(),
-                badge: "操作",
+                badge: "操作".into(),
                 visual: Visual::Glyph { icon: "sticky-note", tint: "orange".into() },
                 score: 0,
             });
@@ -1564,7 +1573,7 @@ impl Launcher {
                 target: Target::Memo(memo.id.clone()),
                 title: memo.title().into(),
                 subtitle: subtitle.into(),
-                badge: if memo.done { "已完成" } else { "备忘录" },
+                badge: (if memo.done { "已完成" } else { "备忘录" }).into(),
                 visual: Visual::Glyph { icon: if memo.done { "circle-check" } else { "sticky-note" }, tint: if memo.done { "slate".into() } else { "orange".into() } },
                 score: 0,
             });
@@ -1742,7 +1751,7 @@ impl Launcher {
                 target: Target::Clip(clip.id.clone()),
                 title: clip.title().into(),
                 subtitle: format!("{} · {}", crate::config::relative_time(clip.time), clip.detail()).into(),
-                badge: if clip.pinned { "固定" } else { "剪贴板" },
+                badge: (if clip.pinned { "固定" } else { "剪贴板" }).into(),
                 visual,
                 score: 0,
             });
@@ -1763,7 +1772,7 @@ impl Launcher {
                 } else {
                     "剪贴板历史已在 设置 → 剪贴板 中关闭".into()
                 },
-                badge: "",
+                badge: "".into(),
                 visual: Visual::Glyph { icon: "clipboard", tint: "slate".into() },
                 score: 0,
             });
@@ -1884,6 +1893,9 @@ impl Launcher {
         }
         let query = self.search_text.clone();
         self.refresh_results_with(&query);
+        if self.external.query == query && !self.external.pages.is_empty() {
+            self.merge_external_results(None);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2743,8 +2755,107 @@ impl Launcher {
         }
         self.refresh_results();
         self.schedule_everything(cx);
+        self.schedule_external(cx);
         self.sync_mini_size(cx);
         cx.notify();
+    }
+
+    pub(crate) fn schedule_external(&mut self, cx: &mut Context<Self>) {
+        self.external.generation += 1;
+        self.external.query = self.search_text.clone();
+        let generation = self.external.generation;
+        self.external.hits.clear();
+        self.external.pages.clear();
+        self.results.retain(|r| !matches!(r.target, Target::External { .. } | Target::LoadMore(_)));
+        let sources = if self.ai_request().is_some() { Vec::new() } else {
+            crate::external_search::eligible(&self.search_text, &self.config.settings.external_sources)
+        };
+        for (source, query) in sources {
+            let cursor = crate::external_search::Cursor::first(&source);
+            self.external.pages.insert(source.id.clone(), crate::external_search::PageState { next: Some(cursor.clone()), total: None, loading: true, error: None });
+            self.request_external_page(source, query, cursor, generation, true, cx);
+        }
+        self.merge_external_results(None);
+    }
+
+    pub(crate) fn load_more_external(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some((source, query)) = crate::external_search::eligible(&self.search_text, &self.config.settings.external_sources).into_iter().find(|(s, _)| s.id == id) else { return; };
+        let Some(state) = self.external.pages.get_mut(id) else { return; };
+        if state.loading { return; }
+        let Some(cursor) = state.next.clone() else { return; };
+        state.loading = true; state.error = None;
+        let selected = self.results.get(self.selected).map(|r| r.target.clone());
+        self.request_external_page(source, query, cursor, self.external.generation, false, cx);
+        self.merge_external_results(selected);
+        cx.notify();
+    }
+
+    fn request_external_page(&mut self, source: crate::external_search::Source, query: String, cursor: crate::external_search::Cursor, generation: u64, debounce: bool, cx: &mut Context<Self>) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let gate = self.external.gates.entry(source.id.clone()).or_insert_with(|| Arc::new(AtomicBool::new(false))).clone();
+            cx.spawn(async move |this, cx| {
+                if debounce { cx.background_executor().timer(Duration::from_millis(180)).await; }
+                loop {
+                    let current = this.read_with(cx, |this, _| this.external.generation == generation).unwrap_or(false);
+                    if !current { return; }
+                    if gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() { break; }
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                }
+                let permit = crate::external_search::Permit(gate);
+                let id = source.id.clone();
+                let outcome = cx.background_spawn(async move { let _permit = permit; crate::external_search::fetch_page(&source, &query, &cursor) }).await;
+                this.update(cx, |this, cx| {
+                    if this.external.generation != generation { return; }
+                    let selected = this.results.get(this.selected).map(|r| r.target.clone());
+                    let Some(state) = this.external.pages.get_mut(&id) else { return; };
+                    state.loading = false;
+                    match outcome {
+                        Ok(page) => {
+                            let hits = this.external.hits.entry(id.clone()).or_default();
+                            let before = hits.len();
+                            let mut seen: std::collections::HashSet<_> = hits.iter().map(|h| h.id.clone()).collect();
+                            hits.extend(page.hits.into_iter().filter(|hit| seen.insert(hit.id.clone())));
+                            state.next = if before > 0 && hits.len() == before { None } else { page.next };
+                            state.total = page.total.or(state.total); state.error = None;
+                            this.external.status.insert(id.clone(), format!("已连接 · 已加载 {} 个结果", hits.len()));
+                        }
+                        Err(error) => { state.error = Some(error.clone()); this.external.status.insert(id, error); }
+                    }
+                    this.merge_external_results(selected);
+                    this.sync_mini_size(cx);
+                    cx.notify();
+                }).ok();
+            }).detach();
+    }
+
+    fn merge_external_results(&mut self, selected: Option<Target>) {
+        self.results.retain(|r| !matches!(r.target, Target::External { .. } | Target::LoadMore(_)));
+        let insert_at = self.results.iter().position(|r| matches!(r.target, Target::File { .. } | Target::WebSearch(_))).unwrap_or(self.results.len()).min(3);
+        let sources: Vec<_> = self.config.settings.external_sources.iter().filter(|s| s.enabled).filter_map(|s| self.external.hits.get(&s.id).map(|hits| (s, hits))).collect();
+        let mut rows = Vec::new();
+        // Round-robin sources so one provider cannot bury another provider's hits.
+        for i in 0..sources.iter().map(|(_, hits)| hits.len()).max().unwrap_or(0) {
+            for (source, hits) in &sources {
+                if let Some(hit) = hits.get(i) {
+                    rows.push(ResultItem { target: Target::External { source: source.id.clone(), id: hit.id.clone(), action: hit.action.clone() },
+                        title: hit.title.clone().into(), subtitle: hit.subtitle.clone().into(), badge: source.name.clone().into(),
+                        visual: Visual::Glyph { icon: "search", tint: "teal".into() }, score: 0 });
+                }
+            }
+        }
+        for source in self.config.settings.external_sources.iter().filter(|s| s.enabled) {
+            if let Some(state) = self.external.pages.get(&source.id) {
+                if state.next.is_some() || state.loading {
+                    let loaded = self.external.hits.get(&source.id).map_or(0, |hits| hits.len());
+                    rows.push(ResultItem { target: Target::LoadMore(source.id.clone()),
+                        title: format!("{} · {}", source.name, if state.loading { "正在加载…" } else if state.error.is_some() { "加载失败，点击重试" } else { "加载更多" }).into(),
+                        subtitle: state.error.clone().unwrap_or_else(|| state.total.map(|total| format!("已加载 {loaded} / {total} 个结果")).unwrap_or_else(|| format!("已加载 {loaded} 个结果"))).into(),
+                        badge: "分页".into(), visual: Visual::Glyph { icon: "search", tint: "teal".into() }, score: 0 });
+                }
+            }
+        }
+        self.results.splice(insert_at..insert_at, rows);
+        self.selected = selected.and_then(|target| self.results.iter().position(|r| r.target == target)).unwrap_or(0);
     }
 
     /// Ask Everything for matching files after a short pause in typing.
@@ -2759,6 +2870,7 @@ impl Launcher {
             || query.chars().count() < 2
             || query.starts_with('>')
             || looks_like_url(&query)
+            || crate::external_search::route(&query, &self.config.settings.external_sources).1.is_some()
         {
             return;
         }
@@ -2794,7 +2906,8 @@ impl Launcher {
 
     /// Insert Everything hits after the local results, before the web-search row.
     fn merge_file_results(&mut self, hits: Vec<crate::everything::FileHit>) {
-        let web = self.results.pop();
+        let selected_target = self.results.get(self.selected).map(|r| r.target.clone());
+        let web = self.results.iter().position(|r| matches!(r.target, Target::WebSearch(_))).map(|i| self.results.remove(i));
         self.results.retain(|r| !matches!(r.target, Target::File { .. }));
         for hit in hits {
             let name = hit
@@ -2831,13 +2944,13 @@ impl Launcher {
                 },
                 title: name.into(),
                 subtitle: parent.into(),
-                badge: if hit.is_dir { "文件夹" } else { "文件" },
+                badge: (if hit.is_dir { "文件夹" } else { "文件" }).into(),
                 visual,
                 score: 0,
             });
         }
         self.results.extend(web);
-        self.selected = self.selected.min(self.results.len().saturating_sub(1));
+        self.merge_external_results(selected_target);
     }
 
     // -----------------------------------------------------------------------
@@ -2895,6 +3008,7 @@ impl Launcher {
         let search = self.search.clone();
         search.update(cx, |input, cx| input.select_all_text(cx));
         window.focus(&search.focus_handle(cx));
+        self.schedule_external(cx);
         let height = self.mini_height();
         cx.spawn(async move |_, _| {
             win::place_mini(hwnd, Self::MINI_WIDTH, height);
@@ -2977,6 +3091,21 @@ impl Launcher {
         self.menu = None;
         let mut hide = true;
         match &target {
+            Target::LoadMore(source) => { self.load_more_external(source, cx); return; }
+            Target::External { source, action, .. } => {
+                match action {
+                    crate::external_search::Activation::Url(url) => self.spawn_launch(url.clone(), String::new(), String::new(), false, cx),
+                    crate::external_search::Activation::Callback { pid, .. } => {
+                        let Some(source) = self.config.settings.external_sources.iter().find(|s| &s.id == source).cloned() else { return; };
+                        crate::win::allow_foreground(*pid);
+                        let action = action.clone();
+                        cx.spawn(async move |this, cx| {
+                            let outcome = cx.background_spawn(async move { crate::external_search::activate(&source, &action) }).await;
+                            this.update(cx, |this, cx| { if let Err(error) = outcome { this.show_toast(error, true, cx); } }).ok();
+                        }).detach();
+                    }
+                }
+            }
             Target::Tool(id) => {
                 if !self.launch_tool_as(id, admin, cx) {
                     return;
@@ -3842,6 +3971,10 @@ fn normalize_url(s: &str) -> String {
     } else {
         format!("https://{s}")
     }
+}
+
+pub(crate) fn external_reserved(s: &str) -> bool {
+    clipboard_filter(s).is_some() || memo_query(s).is_some() || looks_like_url(s)
 }
 
 fn url_encode(s: &str) -> String {

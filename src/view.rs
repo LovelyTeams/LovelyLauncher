@@ -1325,7 +1325,7 @@ impl Launcher {
                             .bg(if selected { theme.panel } else { theme.kbd_bg })
                             .text_size(px(11.5))
                             .text_color(theme.text_muted)
-                            .child(item.badge),
+                            .child(item.badge.clone()),
                     )
                     .when(selected, |d| d.child(icon("enter", 15., theme.accent))),
             );
@@ -1383,7 +1383,7 @@ impl Launcher {
                         .when(!mini, |d| d.child(hint("Ctrl+Enter", "以管理员身份运行")))
                         .child(hint("Esc", "清空"))
                         .child(div().flex_1())
-                        .child(format!("{} 个结果", results.len())),
+                        .child(format!("{} 个结果", results.iter().filter(|r| !matches!(r.target, Target::LoadMore(_))).count())),
                 ),
         )
     }

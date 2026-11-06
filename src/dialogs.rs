@@ -23,6 +23,8 @@ pub enum Dialog {
     Category(CategoryEditor),
     Scan(ScanResults),
     StartMenu(StartMenuImport),
+    SearchSource(SearchSourceEditor),
+    SearchImport(SearchImport),
     Snippet(SnippetEditor),
     Memos(MemoEditor),
 }
@@ -59,6 +61,17 @@ pub struct SnippetEditor {
     back_to_settings: bool,
     focus: FocusHandle,
 }
+
+pub struct SearchSourceEditor {
+    source: crate::external_search::Source,
+    fields: Vec<Entity<TextInput>>,
+    advanced: bool,
+    status: Option<(String, bool)>,
+    testing: bool,
+    focus: FocusHandle,
+}
+
+pub struct SearchImport { sources: Vec<crate::external_search::Source>, focus: FocusHandle }
 
 pub struct StartMenuImport {
     entries: Vec<crate::start_menu::ImportEntry>,
@@ -220,6 +233,8 @@ impl Dialog {
             Dialog::Category(c) => vec![c.name.clone()],
             Dialog::Scan(_) => Vec::new(),
             Dialog::StartMenu(s) => vec![s.query.clone(), s.category.clone()],
+            Dialog::SearchSource(s) => if s.advanced { s.fields.clone() } else { [0, 1, 2, 4, 17].map(|i| s.fields[i].clone()).to_vec() },
+            Dialog::SearchImport(_) => Vec::new(),
             Dialog::Snippet(s) => vec![s.name.clone(), s.text.clone()],
             Dialog::Memos(m) => vec![m.text.clone(), m.when.clone()],
         }
@@ -232,6 +247,8 @@ impl Dialog {
             Dialog::Category(c) => &c.focus,
             Dialog::Scan(s) => &s.focus,
             Dialog::StartMenu(s) => &s.focus,
+            Dialog::SearchSource(s) => &s.focus,
+            Dialog::SearchImport(s) => &s.focus,
             Dialog::Snippet(s) => &s.focus,
             Dialog::Memos(m) => &m.focus,
         }
@@ -1282,6 +1299,8 @@ impl Launcher {
             Some(Dialog::Category(_)) => self.save_category(window, cx),
             Some(Dialog::Scan(_)) => self.close_dialog(window, cx),
             Some(Dialog::StartMenu(_)) => self.import_start_menu(false, window, cx),
+            Some(Dialog::SearchSource(_)) => self.save_search_source(window, cx),
+            Some(Dialog::SearchImport(_)) => self.confirm_search_import(window, cx),
             Some(Dialog::Snippet(_)) => self.save_snippet(window, cx),
             Some(Dialog::Memos(_)) => self.save_memo(window, cx),
             None => {}
@@ -1655,7 +1674,7 @@ impl Launcher {
                 let visual = Self::tool_visual(&draft);
                 Some(self.tile(&visual, 56., 28., theme, cx))
             }
-            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) | Dialog::Snippet(_) | Dialog::Memos(_) => {
+            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) | Dialog::Snippet(_) | Dialog::Memos(_) | Dialog::SearchSource(_) | Dialog::SearchImport(_) => {
                 None
             }
         };
@@ -1671,6 +1690,31 @@ impl Launcher {
         }).collect();
         let dialog = self.dialog.as_ref()?;
         let (title, body, footer) = match dialog {
+            Dialog::SearchImport(import) => ("导入 HTTP 搜索源",
+                div().flex().flex_col().gap(px(12.))
+                    .child(div().text_size(px(12.)).text_color(theme.text_muted).child("检查名称、地址和分页方式后保存。同前缀会更新已有搜索源，Token 在本机加密保存。"))
+                    .children(import.sources.iter().map(|source| div().p(px(10.)).rounded(px(8.)).border_1().border_color(theme.border)
+                        .child(div().text_size(px(14.)).child(format!("{} · {}", source.name, source.keyword)))
+                        .child(div().text_size(px(12.)).text_color(theme.text_muted).child(source.url.clone()))
+                        .child(div().text_size(px(12.)).text_color(theme.text_faint).child(format!("{} · 分页 {} · 每页 {} 条 · {}", source.method, source.pagination, source.limit, if source.enabled {"启用"} else {"停用"})))))
+                    .into_any_element(),
+                div().flex_none().px(px(22.)).py(px(16.)).flex().items_center().gap(px(10.)).child(div().flex_1())
+                    .child(button("import-search-cancel", "取消", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_search_settings(window, cx))))
+                    .child(button("import-search-save", "保存搜索源", true, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.confirm_search_import(window, cx))))
+                    .into_any_element()),
+            Dialog::SearchSource(s) => (if self.config.settings.external_sources.iter().any(|source| source.id == s.source.id) { "编辑 HTTP 搜索源" } else { "添加 HTTP 搜索源" }, self.render_search_source(s, theme, window, cx),
+                div().flex_none().px(px(22.)).py(px(16.)).flex().items_center().gap(px(10.))
+                    .child(button("source-test", if s.testing { "正在测试…" } else { "测试搜索" }, false, theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.test_search_source(cx))))
+                    .child(button("source-export", "复制配置", false, theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        match this.read_search_source(cx) {
+                            Ok(source) => { let value = serde_json::json!({"version":1,"sources":[crate::external_search::portable(&source)]}); cx.write_to_clipboard(gpui::ClipboardItem::new_string(serde_json::to_string_pretty(&value).unwrap())); this.show_toast("已复制配置（不含 Token）", false, cx); }
+                            Err(error) => { if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.status = Some((error, true)); } cx.notify(); }
+                        }
+                    })))
+                    .child(div().flex_1())
+                    .child(button("source-cancel", "取消", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_search_settings(window, cx))))
+                    .child(button("source-save", "保存", true, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_search_source(window, cx))))
+                    .into_any_element()),
             Dialog::StartMenu(s) => (
                 "导入开始菜单程序",
                 self.render_start_menu(s, import_tiles, theme, window, cx),
@@ -3578,6 +3622,171 @@ impl Launcher {
             .into_any_element()
     }
 
+    fn open_search_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+        if let Some(Dialog::Settings(s)) = self.dialog.as_mut() { s.tab = SettingsTab::Search; }
+    }
+
+    fn preview_search_import(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::external_search::parse_import(text, &self.config.settings.external_sources, true) {
+            Ok(sources) => {
+                self.commit_settings_inputs(cx);
+                let focus = cx.focus_handle(); window.focus(&focus);
+                self.dialog = Some(Dialog::SearchImport(SearchImport { sources, focus })); cx.notify();
+            }
+            Err(error) => self.show_toast(error, true, cx),
+        }
+    }
+
+    fn pick_search_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("选择 HTTP 搜索源 JSON 配置".into()) });
+        self.prompting = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let path = rx.await.ok().and_then(|result| result.ok()).flatten().and_then(|paths| paths.into_iter().next());
+            this.update_in(cx, |this, window, cx| {
+                this.prompting = false;
+                let Some(path) = path else { return; };
+                match crate::search_config::read_input(&path) {
+                    Ok(text) => this.preview_search_import(&text, window, cx),
+                    Err(error) => this.show_toast(error, true, cx),
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn confirm_search_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::SearchImport(import)) = &self.dialog else { return; };
+        let count = import.sources.len();
+        let mut config = self.config.clone();
+        for source in &import.sources {
+            if let Err(error) = crate::external_search::validate(source, &config.settings.external_sources) { self.show_toast(error, true, cx); return; }
+            if let Some(old) = config.settings.external_sources.iter_mut().find(|old| old.id == source.id) { *old = source.clone(); }
+            else { config.settings.external_sources.push(source.clone()); }
+        }
+        match config.try_save() {
+            Ok(()) => { self.config = config; self.refresh_results(); self.schedule_external(cx); self.open_search_settings(window, cx); self.show_toast(format!("已保存 {count} 个搜索源"), false, cx); }
+            Err(error) => self.show_toast(error, true, cx),
+        }
+    }
+
+    fn open_search_source(&mut self, source: crate::external_search::Source, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_settings_inputs(cx);
+        let source = self.config.settings.external_sources.iter().find(|s| s.id == source.id).cloned().unwrap_or(source);
+        let token = crate::external_search::open_secret(&source.secret);
+        let values = [source.name.clone(), source.keyword.clone(), source.url.clone(), source.total_path.clone(), token.clone().unwrap_or_default(),
+            source.auth_scheme.clone(), source.request.clone(), source.results_path.clone(), source.id_path.clone(), source.title_path.clone(),
+            source.subtitle_path.clone(), source.snippet_path.clone(), source.open_url.clone(), source.activate_url.clone(), source.limit.to_string(),
+            source.timeout_ms.to_string(), source.auth_header.clone(), "test".into(), source.has_more_path.clone(), source.next_cursor_path.clone(), source.first_page.to_string()];
+        let fields: Vec<_> = values.iter().enumerate().map(|(i, value)| {
+            if i == 4 { let text = value.clone(); cx.new(|cx| { let mut input = TextInput::new("可留空；仅本机加密保存", cx).masked(); input.set_text(text, cx); input }) }
+            else { new_input(cx, "", value) }
+        }).collect();
+        let first = fields[0].clone();
+        self.dialog = Some(Dialog::SearchSource(SearchSourceEditor { source, fields, advanced: false,
+            status: token.err().map(|e| (e, true)), testing: false, focus: cx.focus_handle() }));
+        window.focus(&first.focus_handle(cx)); cx.notify();
+    }
+
+    fn read_search_source(&self, cx: &Context<Self>) -> Result<crate::external_search::Source, String> {
+        let Some(Dialog::SearchSource(s)) = &self.dialog else { return Err("搜索源编辑器未打开".into()); };
+        let v: Vec<_> = s.fields.iter().map(|e| e.read(cx).text().trim().to_string()).collect();
+        let mut source = s.source.clone();
+        source.name = v[0].clone(); source.keyword = v[1].clone(); source.url = v[2].clone(); source.total_path = v[3].clone();
+        source.secret = crate::external_search::seal_secret(&v[4])?;
+        source.auth_scheme = v[5].clone(); source.request = v[6].clone(); source.results_path = v[7].clone(); source.id_path = v[8].clone();
+        source.title_path = v[9].clone(); source.subtitle_path = v[10].clone(); source.snippet_path = v[11].clone(); source.open_url = v[12].clone();
+        source.activate_url = v[13].clone(); source.limit = v[14].parse().map_err(|_| "结果数需要填写整数")?;
+        source.timeout_ms = v[15].parse().map_err(|_| "超时需要填写整数毫秒")?; source.auth_header = v[16].clone();
+        source.has_more_path = v[18].clone(); source.next_cursor_path = v[19].clone(); source.first_page = v[20].parse().map_err(|_| "起始页需要填写 0 或 1")?;
+        crate::external_search::validate(&source, &self.config.settings.external_sources)?; Ok(source)
+    }
+
+    fn save_search_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self.read_search_source(cx).and_then(|source| {
+            let mut config = self.config.clone();
+            if let Some(old) = config.settings.external_sources.iter_mut().find(|s| s.id == source.id) { *old = source; }
+            else { config.settings.external_sources.push(source); }
+            config.try_save()?; Ok(config)
+        });
+        match result {
+            Ok(config) => { self.config = config; self.refresh_results(); self.schedule_external(cx); self.open_search_settings(window, cx); }
+            Err(error) => { if let Some(Dialog::SearchSource(s)) = self.dialog.as_mut() { s.status = Some((error, true)); } cx.notify(); }
+        }
+    }
+
+    fn test_search_source(&mut self, cx: &mut Context<Self>) {
+        let source = match self.read_search_source(cx) {
+            Ok(s) => s,
+            Err(error) => { if let Some(Dialog::SearchSource(s)) = self.dialog.as_mut() { s.status = Some((error, true)); } cx.notify(); return; }
+        };
+        let Some(Dialog::SearchSource(s)) = self.dialog.as_mut() else { return; };
+        if s.testing { return; }
+        let query = s.fields[17].read(cx).text().trim().to_string();
+        if query.is_empty() { s.status = Some(("请填写测试搜索词".into(), true)); cx.notify(); return; }
+        let identity = s.fields[0].clone(); s.testing = true; s.status = None;
+        cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async move { crate::external_search::search(&source, &query) }).await;
+            this.update(cx, |this, cx| {
+                if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() {
+                    if s.fields[0] == identity {
+                        s.testing = false;
+                        s.status = Some(match outcome { Ok(hits) => (format!("连接成功 · {} 个结果{}", hits.len(), hits.first().map(|h| format!(" · {}", h.title)).unwrap_or_default()), false), Err(e) => (e, true) });
+                        cx.notify();
+                    }
+                }
+            }).ok();
+        }).detach(); cx.notify();
+    }
+
+    fn render_search_source(&self, s: &SearchSourceEditor, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let field = |i: usize, title| div().child(label(title, theme)).child(self.input_box(&s.fields[i], theme, window, cx));
+        let mut example = crate::external_search::import_schema()["examples"][0].clone();
+        example["sources"][0]["token"] = serde_json::json!("your-token");
+        let example = serde_json::to_string_pretty(&example).unwrap_or_default();
+        div().flex().flex_col().gap(px(10.))
+            .child(div().flex().items_center().gap(px(10.))
+                .child(div().flex_1().text_size(px(12.)).text_color(theme.text_muted).child("手动填写连接信息，或导入已有的 JSON 配置。"))
+                .child(button("source-import-file", "导入 JSON", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.pick_search_import(window, cx)))))
+            .child(div().text_size(px(12.)).text_color(theme.text_muted).child("普通搜索合并已启用来源；输入“前缀 搜索词”只查询该来源。Token 仅本机加密保存。"))
+            .child(div().flex().gap(px(10.)).child(field(0, "名称").flex_1()).child(field(1, "搜索前缀（如 notes）").w(px(180.))))
+            .child(field(2, "完整 HTTP(S) 查询地址（GET 可用 {query}）"))
+            .child(field(4, "认证 Token（接口无需认证时可留空）"))
+            .child(div().flex().items_center().gap(px(10.)).child(switch("source-enabled", s.source.enabled, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.source.enabled = !s.source.enabled; } cx.notify(); })))
+                .child(div().text_size(px(13.)).child("启用"))
+                .child(switch("source-global", s.source.global, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.source.global = !s.source.global; } cx.notify(); })))
+                .child(div().text_size(px(13.)).child("参与全局搜索")))
+            .child(field(17, "测试搜索词"))
+            .when_some(s.status.clone(), |d, (text, error)| d.child(div().text_size(px(12.)).text_color(if error { theme.danger } else { theme.accent }).child(text)))
+            .child(button("source-advanced", if s.advanced { "收起高级配置" } else { "高级配置：请求、映射及打开方式" }, false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.advanced = !s.advanced; } cx.notify(); })))
+            .when(s.advanced, |d| d
+                .child(div().flex().items_center().gap(px(10.)).child(label("请求方式", theme))
+                    .child(button("source-method", if s.source.method == "GET" { "GET" } else { "POST" }, false, theme)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| { if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.source.method = if s.source.method == "GET" { "POST" } else { "GET" }.into(); } cx.notify(); }))))
+                .child(div().text_size(px(13.)).child("分页方式"))
+                .child(div().flex().flex_wrap().gap(px(6.)).children([("none","不分页"),("page","页码"),("offset","偏移量"),("cursor","游标")].into_iter().enumerate().map(|(i,(mode,name))| {
+                    button("page-mode", name, s.source.pagination == mode, theme).id(("page-mode",i)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(Dialog::SearchSource(s)) = this.dialog.as_mut() { s.source.pagination = mode.into(); } cx.notify();
+                    }))
+                })))
+                .children([(5,"认证前缀（Bearer / Token / 留空）"),(16,"认证请求头名称"),
+                    (6,"JSON 请求正文（{query}、\"{limit}\"、\"{page}\"、\"{offset}\"、{cursor}）"),(7,"结果数组路径（如 results / data.items；根数组留空）"),
+                    (8,"结果 ID 字段"),(9,"标题字段"),(10,"副标题字段（可选）"),(11,"摘要字段（可选）"),
+                    (12,"打开链接模板（如 notes://open/{id}；可选）"),(13,"激活接口地址（与链接模板二选一）"),(14,"每页结果数（1～50）"),(15,"请求超时（毫秒，200～10000）"),
+                    (20,"起始页（0 或 1）"),(3,"结果总数字段路径（可选）"),(18,"是否还有结果的布尔字段路径（可选）"),(19,"下一页游标字段路径（游标分页必填）")]
+                    .into_iter().map(|(i, name)| field(i, name)))
+                .child(div().text_size(px(12.)).text_color(theme.text_faint).child("标准接口返回 results 数组；激活接口接收 action 对象或 {id, session}。字段使用点分路径。选择分页后，请在请求中填写对应占位符。结果列表支持加载更多。")))
+            .child(label("JSON 配置示例", theme))
+            .child(div().text_size(px(12.)).text_color(theme.text_faint).child("将地址、Token 和字段映射替换为实际接口配置，保存为 UTF-8 JSON 文件后导入。无需认证时可省略 token。"))
+            .child(div().id("source-json-example").max_h(px(240.)).overflow_y_scroll().overflow_x_scroll()
+                .p(px(10.)).rounded(px(8.)).bg(theme.kbd_bg).border_1().border_color(theme.border)
+                .font_family("Consolas").text_size(px(11.5)).line_height(px(18.)).text_color(theme.text_muted)
+                .children(example.lines().map(|line| div().whitespace_nowrap().child(line.to_string()))))
+            .into_any_element()
+    }
+
     fn render_search_settings(&self, editor: &SettingsEditor, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.config.settings.search_engine.clone();
         let engines = crate::config::SEARCH_ENGINES.iter().enumerate().map(|(ix, (name, url))| {
@@ -3618,6 +3827,23 @@ impl Launcher {
                     .child("搜索不到本地结果时，列表最后一项会用这里的搜索引擎在网页上搜索。"),
             )
             .child(div().flex().flex_wrap().gap(px(8.)).children(engines))
+            .child(label("外部搜索源", theme))
+            .child(div().text_size(px(12.)).text_color(theme.text_muted).child("连接任意兼容的 HTTP 搜索接口，配置认证、字段映射和分页。使用前缀可限定来源。"))
+            .children(self.config.settings.external_sources.iter().enumerate().map(|(i, source)| {
+                let edit = source.clone(); let id = source.id.clone();
+                div().id(("search-source", i)).p(px(10.)).rounded(px(9.)).border_1().border_color(theme.border).flex().items_center().gap(px(8.))
+                    .child(switch(("source-on", i), source.enabled, theme).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(s) = this.config.settings.external_sources.iter_mut().find(|s| s.id == id) { s.enabled = !s.enabled; }
+                        this.config.save(); this.refresh_results(); this.schedule_external(cx); cx.notify();
+                    })))
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(3.))
+                        .child(div().text_size(px(13.)).child(format!("{} · {} 搜索词", source.name, source.keyword)))
+                        .child(div().text_size(px(11.)).text_color(theme.text_faint).truncate().child(self.external.status.get(&source.id).cloned().unwrap_or_else(|| if source.enabled { "尚未查询" } else { "已停用" }.into()))))
+                    .child(button("source-edit", "配置", false, theme).id(("source-edit",i)).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_search_source(edit.clone(), window, cx))))
+                    .child(div().id(("source-delete",i)).px(px(5.)).cursor_pointer().text_size(px(12.)).text_color(theme.text_muted).child("移除")
+                        .on_click(cx.listener({let id = source.id.clone(); move |this, _: &ClickEvent, _, cx| { this.config.settings.external_sources.retain(|s| s.id != id); this.config.save(); this.refresh_results(); this.schedule_external(cx); cx.notify(); }})))
+            }))
+            .child(button("source-new", "添加 HTTP 搜索源", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_search_source(Default::default(), window, cx))))
             .child(label("自定义搜索地址（用 {q} 表示搜索词）", theme))
             .child(self.input_box(&editor.search_url, theme, window, cx))
             .child(
