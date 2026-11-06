@@ -3121,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "lovely-launcher"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "embed-resource",
  "futures",
