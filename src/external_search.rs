@@ -81,9 +81,9 @@ pub fn validate(source: &Source, others: &[Source]) -> Result<(), String> {
         .keyword
         .chars()
         .any(|c| !c.is_ascii_alphanumeric() && c != '-')
-        || ["cb", "bw", "tx", "ai"].contains(&source.keyword.to_ascii_lowercase().as_str())
+        || ["cb", "bw", "tx", "memo", "ai"].contains(&source.keyword.to_ascii_lowercase().as_str())
     {
-        return Err("前缀只能使用英文字母、数字和连字符，且不能占用 cb / bw / tx / ai".into());
+        return Err("前缀只能使用英文字母、数字和连字符，且不能占用 cb / bw / tx / memo / ai".into());
     }
     if others
         .iter()
@@ -169,13 +169,15 @@ fn safe_open_url(url: &str) -> bool {
 }
 
 pub fn route<'a>(raw: &'a str, sources: &'a [Source]) -> (&'a str, Option<&'a str>) {
-    let raw = raw.trim();
-    let (prefix, query) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
-    sources
-        .iter()
-        .find(|s| s.enabled && s.keyword.eq_ignore_ascii_case(prefix))
-        .map(|s| (query.trim(), Some(s.id.as_str())))
-        .unwrap_or((raw, None))
+    let raw = raw.trim_start();
+    raw.split_once(char::is_whitespace)
+        .and_then(|(prefix, query)| {
+            sources
+                .iter()
+                .find(|s| s.enabled && s.keyword.eq_ignore_ascii_case(prefix))
+                .map(|s| (query.trim(), Some(s.id.as_str())))
+        })
+        .unwrap_or((raw.trim_end(), None))
 }
 
 pub fn eligible(raw: &str, sources: &[Source]) -> Vec<(Source, String)> {
@@ -183,7 +185,9 @@ pub fn eligible(raw: &str, sources: &[Source]) -> Vec<(Source, String)> {
     if query.is_empty()
         || query.len() > 1024
         || (only.is_none()
-            && (query.starts_with(['>', '@']) || crate::launcher::external_reserved(query)))
+            && (query.starts_with(['>', '@'])
+                || crate::launcher::external_reserved(query)
+                || sources.iter().any(|s| s.enabled && s.keyword.eq_ignore_ascii_case(query))))
     {
         return Vec::new();
     }
@@ -269,12 +273,9 @@ impl Drop for Permit {
 fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
     path.split('.')
         .filter(|p| !p.is_empty())
-        .fold(value, |v, p| {
-            if let Ok(i) = p.parse::<usize>() {
-                &v[i]
-            } else {
-                &v[p]
-            }
+        .fold(value, |v, p| match p.parse::<usize>() {
+            Ok(i) if v.is_array() => &v[i],
+            _ => &v[p],
         })
 }
 fn text_at(value: &Value, path: &str) -> String {
@@ -376,10 +377,19 @@ fn request(source: &Source, url: &str, body: Option<&[u8]>, method: &str) -> Res
         return Err(format!("接口返回 HTTP {status}"));
     }
     let value: Value = serde_json::from_slice(&raw).map_err(|_| "接口没有返回合法 JSON")?;
-    if value["code"].as_i64().is_some_and(|code| code != 0) || value.get("error").is_some() {
+    if reports_failure(&value) {
         return Err("接口报告查询失败，请检查认证和请求配置".into());
     }
     Ok(value)
+}
+
+fn reports_failure(value: &Value) -> bool {
+    let error = match value.get("error") {
+        None | Some(Value::Null | Value::Bool(false)) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    };
+    error || value["code"].as_i64().is_some_and(|code| code != 0 && code != 200)
 }
 
 pub fn search(source: &Source, query: &str) -> Result<Vec<Hit>, String> {
@@ -753,7 +763,11 @@ mod tests {
             },
         ];
         assert_eq!(route("notes search", &s), ("search", Some("notes")));
+        assert_eq!(route("notes", &s), ("notes", None));
+        assert_eq!(route("notes ", &s), ("", Some("notes")));
+        assert_eq!(route("notesearch", &s), ("notesearch", None));
         assert_eq!(eligible("docs", &s).len(), 0);
+        assert_eq!(eligible("docs ", &s).len(), 0);
         assert_eq!(eligible("@ai secret", &s).len(), 0);
         assert_eq!(eligible("cb secret", &s).len(), 0);
         assert_eq!(eligible("SM2", &s).len(), 2);
@@ -767,6 +781,17 @@ mod tests {
         s.auth_header = "Authorization".into();
         s.url = "http://example.com/search".into();
         assert!(validate(&s, &[]).is_err());
+        let memo = Source { keyword: "MEMO".into(), ..Default::default() };
+        assert!(validate(&memo, &[]).is_err());
+    }
+    #[test]
+    fn provider_failure_detection() {
+        assert!(!reports_failure(&json!({"results":[],"error":null,"code":0})));
+        assert!(!reports_failure(&json!({"results":[],"code":200,"error":false})));
+        assert!(!reports_failure(&json!([{"id":1}])));
+        assert!(reports_failure(&json!({"code":401})));
+        assert!(reports_failure(&json!({"error":"unauthorized"})));
+        assert!(reports_failure(&json!({"error":{"message":"bad"}})));
     }
     #[test]
     fn field_mapping_and_text() {
@@ -774,6 +799,7 @@ mod tests {
             text_at(&json!({"data":{"items":[{"id":7}]}}), "data.items.0.id"),
             "7"
         );
+        assert_eq!(text_at(&json!({"data":{"0":"x"}}), "data.0"), "x");
         assert_eq!(plain("<mark>SM2</mark> &amp; 算法", 100), "SM2 & 算法");
     }
     #[test]

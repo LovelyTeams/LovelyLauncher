@@ -1230,7 +1230,7 @@ impl Launcher {
         self.results.clear();
         self.selected = 0;
         self.results_scroll.set_offset(Default::default());
-        if crate::external_search::route(raw, &self.config.settings.external_sources).1.is_some() {
+        if crate::external_search::route(query, &self.config.settings.external_sources).1.is_some() {
             return;
         }
         if q.is_empty() {
@@ -2870,7 +2870,7 @@ impl Launcher {
             || query.chars().count() < 2
             || query.starts_with('>')
             || looks_like_url(&query)
-            || crate::external_search::route(&query, &self.config.settings.external_sources).1.is_some()
+            || crate::external_search::route(&self.search_text, &self.config.settings.external_sources).1.is_some()
         {
             return;
         }
